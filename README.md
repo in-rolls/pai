@@ -1,4 +1,4 @@
-# Resumable PAI scraper
+# PAI scraper
 
 ## Install
 
