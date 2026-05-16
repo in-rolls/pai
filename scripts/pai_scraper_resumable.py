@@ -63,6 +63,8 @@ YEAR_CONFIGS = {
 
 RESULT_TABLE_SELECTOR = "#GVdataT"
 NEXT_BUTTON_SELECTOR = "#btnNext"
+SWEETALERT_OVERLAY_SELECTOR = ".sweet-overlay"
+SWEETALERT_CONFIRM_SELECTOR = ".sweet-alert button.confirm, .sweet-alert .sa-confirm-button-container button"
 
 BAD_OPTION_TEXT = (
     "-select-",
@@ -241,6 +243,46 @@ def setup_logger(out_dir: Path) -> logging.Logger:
     return logger
 
 
+async def dismiss_sweetalert(page, logger: logging.Logger) -> Optional[str]:
+    """
+    Dismiss any visible SweetAlert modal and return the message text if one was found.
+    Returns None if no modal was visible.
+    """
+    try:
+        overlay = page.locator(SWEETALERT_OVERLAY_SELECTOR)
+        if await overlay.count() == 0:
+            return None
+
+        is_visible = await overlay.evaluate("el => window.getComputedStyle(el).display !== 'none'")
+        if not is_visible:
+            return None
+
+        message = ""
+        try:
+            alert_box = page.locator(".sweet-alert")
+            if await alert_box.count() > 0:
+                message = await alert_box.inner_text()
+                message = message.strip()
+        except Exception:
+            pass
+
+        confirm_btn = page.locator(SWEETALERT_CONFIRM_SELECTOR)
+        if await confirm_btn.count() > 0:
+            await confirm_btn.first.click(timeout=5000)
+            await page.wait_for_timeout(500)
+            logger.info("Dismissed SweetAlert: %s", message[:100] if message else "(no message)")
+            return message
+
+        await overlay.click(timeout=5000)
+        await page.wait_for_timeout(500)
+        logger.info("Dismissed SweetAlert by clicking overlay: %s", message[:100] if message else "(no message)")
+        return message
+
+    except Exception as e:
+        logger.debug("dismiss_sweetalert error (non-fatal): %s", e)
+        return None
+
+
 async def get_options(page, selector: str, timeout: int = 60) -> List[Dict[str, str]]:
     start = asyncio.get_event_loop().time()
 
@@ -294,15 +336,15 @@ async def goto_pai_form(page, url: str, logger: logging.Logger) -> bool:
         logger.info("Navigating attempt %s/3: %s", attempt, url)
 
         try:
-            await page.goto(url, wait_until="commit", timeout=90000)
+            await page.goto(url, wait_until="commit", timeout=120000)
         except Exception as e:
             last_error = e
             logger.warning("goto(commit) failed on attempt %s/3: %s", attempt, e)
 
         try:
             # Give the parser time to build the form. Do not call window.stop too early.
-            await page.wait_for_selector("#ddl_State", state="attached", timeout=90000)
-            await page.wait_for_selector("#btnSubmit", state="attached", timeout=90000)
+            await page.wait_for_selector("#ddl_State", state="attached", timeout=120000)
+            await page.wait_for_selector("#btnSubmit", state="attached", timeout=120000)
             return True
         except PlaywrightTimeoutError as e:
             last_error = e
@@ -369,35 +411,65 @@ async def load_year_page(
     return info
 
 
-async def ensure_state_district(page, state: Dict[str, str], district: Dict[str, str]) -> None:
+async def ensure_state_district(page, state: Dict[str, str], district: Dict[str, str], logger: logging.Logger) -> None:
+    await dismiss_sweetalert(page, logger)
     await page.wait_for_selector("#ddl_State", state="attached", timeout=60000)
 
     if await get_select_value(page, "#ddl_State") != state["value"]:
         await select_value(page, "#ddl_State", state["value"])
+        await dismiss_sweetalert(page, logger)
         await get_options(page, "#ddl_District", timeout=60)
 
     if await get_select_value(page, "#ddl_District") != district["value"]:
         await select_value(page, "#ddl_District", district["value"])
+        await dismiss_sweetalert(page, logger)
         await get_options(page, "#ddl_Block", timeout=60)
 
 
-async def click_search(page, logger: logging.Logger) -> None:
+async def click_search(page, logger: logging.Logger) -> Optional[str]:
+    """
+    Click search and wait for results or a SweetAlert.
+    Returns the SweetAlert message if one appeared (e.g., "Details are not available"),
+    or None if results loaded normally.
+    """
     await page.click("#btnSubmit")
 
-    # ASP.NET postback may not produce a clean lifecycle event.
     try:
         await page.wait_for_load_state("commit", timeout=15000)
     except Exception:
         pass
 
-    await page.wait_for_selector("#ddl_State", state="attached", timeout=60000)
+    for _ in range(60):
+        await page.wait_for_timeout(500)
+
+        alert_msg = await dismiss_sweetalert(page, logger)
+        if alert_msg:
+            return alert_msg
+
+        try:
+            if await page.locator("#ddl_State").count() > 0:
+                if await page.locator(RESULT_TABLE_SELECTOR).count() > 0:
+                    await page.wait_for_timeout(1000)
+                    return None
+        except Exception:
+            pass
 
     try:
-        await page.wait_for_selector(RESULT_TABLE_SELECTOR, state="attached", timeout=90000)
+        await page.wait_for_selector("#ddl_State", state="attached", timeout=60000)
     except PlaywrightTimeoutError:
-        logger.warning("Result table did not appear within 90s.")
+        logger.warning("Form controls did not reappear after search.")
 
-    await page.wait_for_timeout(1500)
+    alert_msg = await dismiss_sweetalert(page, logger)
+    if alert_msg:
+        return alert_msg
+
+    try:
+        await page.wait_for_selector(RESULT_TABLE_SELECTOR, state="attached", timeout=60000)
+    except PlaywrightTimeoutError:
+        logger.warning("Result table did not appear within 60s.")
+
+    await page.wait_for_timeout(500)
+    return None
 
 
 async def save_html(page, html_path: Path) -> None:
@@ -437,22 +509,29 @@ async def table_signature(page) -> str:
 
 
 async def click_next_page(page, logger: logging.Logger) -> None:
+    await dismiss_sweetalert(page, logger)
+
     old_sig = await table_signature(page)
 
-    await page.click(NEXT_BUTTON_SELECTOR)
+    await page.click(NEXT_BUTTON_SELECTOR, timeout=30000)
 
     try:
         await page.wait_for_load_state("commit", timeout=15000)
     except Exception:
         pass
 
-    await page.wait_for_selector("#ddl_State", state="attached", timeout=60000)
-
     for _ in range(30):
         await page.wait_for_timeout(1000)
-        new_sig = await table_signature(page)
-        if new_sig and new_sig != old_sig:
-            return
+
+        await dismiss_sweetalert(page, logger)
+
+        try:
+            if await page.locator("#ddl_State").count() > 0:
+                new_sig = await table_signature(page)
+                if new_sig and new_sig != old_sig:
+                    return
+        except Exception:
+            pass
 
     logger.warning("Table signature did not change after Next click; continuing anyway.")
 
@@ -655,7 +734,21 @@ async def scrape_block(
 
     prior = done_status(block_dir)
     if prior and not args.overwrite:
+        prior_status = prior.get("status", "")
         prior_rows = int(prior.get("gp_rows", 0) or 0)
+        if prior_status == "done_no_data_available":
+            logger.info("Skipping block (no data available): %s", block_dir)
+            return {
+                "status": "skipped_no_data",
+                "block_dir": str(block_dir),
+                "data_wide_csv": str(data_wide_csv),
+                "metadata_csv": str(metadata_csv),
+                "scores_long_csv": str(scores_long_csv),
+                "html_pages": 0,
+                "gp_rows": 0,
+                "score_rows": 0,
+                "error": "",
+            }
         if prior_rows > 0 or not args.retry_empty:
             logger.info("Skipping done block: %s", block_dir)
             return {
@@ -673,9 +766,43 @@ async def scrape_block(
     block_dir.mkdir(parents=True, exist_ok=True)
     write_json(block_dir / "context.json", context_obj(run_id, year, page_info, state, district, block, block_dir))
 
-    await ensure_state_district(page, state, district)
+    await ensure_state_district(page, state, district, logger)
     await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
-    await click_search(page, logger)
+    alert_msg = await click_search(page, logger)
+
+    if alert_msg and "not available" in alert_msg.lower():
+        logger.info(
+            "[%s] %s / %s / %s: No data available (server message)",
+            year,
+            clean_label(state["text"]),
+            clean_label(district["text"]),
+            clean_label(block["text"]),
+        )
+        status = "done_no_data_available"
+        done_obj = {
+            "status": status,
+            "timestamp_utc": utc_now(),
+            "run_id": run_id,
+            "year": year,
+            "state": clean_label(state["text"]),
+            "state_value": state["value"],
+            "district": clean_label(district["text"]),
+            "district_value": district["value"],
+            "block": clean_label(block["text"]),
+            "block_value": block["value"],
+            "block_dir": str(block_dir),
+            "data_wide_csv": str(data_wide_csv),
+            "metadata_csv": str(metadata_csv),
+            "scores_long_csv": str(scores_long_csv),
+            "html_pages": 0,
+            "gp_rows": 0,
+            "score_rows": 0,
+            "server_message": alert_msg,
+        }
+        write_json(done_json, done_obj)
+        if failed_json.exists():
+            failed_json.unlink()
+        return done_obj
 
     all_wide_rows: List[Dict[str, Any]] = []
     all_meta_rows: List[Dict[str, Any]] = []
@@ -975,7 +1102,7 @@ async def scrape_year(
             districts_pbar.set_postfix_str(clean_label(district["text"])[:25])
 
             try:
-                await ensure_state_district(page, state, district)
+                await ensure_state_district(page, state, district, logger)
                 blocks = await get_options(page, "#ddl_Block", timeout=60)
             except Exception as e:
                 logger.error(
