@@ -54,14 +54,46 @@ YEAR_CONFIGS = {
     "2022-2023": {
         "url": "https://pai.gov.in/PS/Public/TW-GP.aspx?s=1",
         "expected_fy_value": "1",
+        # Legacy PAI 1.0 page: results in #GVdataT, GP-anchor-first layout.
+        "result_table": "#GVdataT",
+        "layout": "legacy",
     },
     "2023-2024": {
         "url": "https://pai.gov.in/PS/Public/TW-GP-New.aspx?s=2",
         "expected_fy_value": "2",
+        # PAI 2.0 "New" page: results in #GVdata, flat State/District/Block/GP
+        # /Overall + per-theme (score, grade) columns.
+        "result_table": "#GVdata",
+        "layout": "flat",
     },
 }
 
+# Default selector for the legacy (2022-2023) page. The 2023-2024 path passes
+# its own selector/layout explicitly via YEAR_CONFIGS.
 RESULT_TABLE_SELECTOR = "#GVdataT"
+
+# When --block-third-party is set, abort these. The PAI server serves its large
+# DataTables export libraries (dataTables.js ~675KB, jszip ~386KB, vfs_fonts,
+# pdfmake) very slowly during load spikes; because they are blocking <script>s
+# in the <head>, the HTML parser stalls there and the form (#ddl_State) never
+# renders in the browser even though the page itself returns fine. None of them
+# are needed to read the raw results table or paginate via #btnNext, so we drop
+# them. The small DDLFill_v1.js (dropdown cascade) is essential and NOT blocked.
+BLOCKED_URL_SUBSTRINGS = (
+    "googletagmanager",
+    "google-analytics",
+    "bhashini",
+    "datatables",
+    "jszip",
+    "vfs_fonts",
+    "pdfmake",
+)
+BLOCKED_RESOURCE_TYPES = ("image", "font", "media")
+
+# The results table paginates 100 GPs per "Next 100 >>" click. On the 2023-2024
+# (flat) page the server never marks #btnNext disabled, so we detect the last
+# page by a short page (fewer than 100 rows) plus a table-change check.
+FLAT_PAGE_SIZE = 100
 NEXT_BUTTON_SELECTOR = "#btnNext"
 SWEETALERT_OVERLAY_SELECTOR = ".sweet-overlay"
 SWEETALERT_CONFIRM_SELECTOR = ".sweet-alert button.confirm, .sweet-alert .sa-confirm-button-container button"
@@ -426,7 +458,7 @@ async def ensure_state_district(page, state: Dict[str, str], district: Dict[str,
         await get_options(page, "#ddl_Block", timeout=60)
 
 
-async def click_search(page, logger: logging.Logger) -> Optional[str]:
+async def click_search(page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR) -> Optional[str]:
     """
     Click search and wait for results or a SweetAlert.
     Returns the SweetAlert message if one appeared (e.g., "Details are not available"),
@@ -448,7 +480,7 @@ async def click_search(page, logger: logging.Logger) -> Optional[str]:
 
         try:
             if await page.locator("#ddl_State").count() > 0:
-                if await page.locator(RESULT_TABLE_SELECTOR).count() > 0:
+                if await page.locator(result_selector).count() > 0:
                     await page.wait_for_timeout(1000)
                     return None
         except Exception:
@@ -464,7 +496,7 @@ async def click_search(page, logger: logging.Logger) -> Optional[str]:
         return alert_msg
 
     try:
-        await page.wait_for_selector(RESULT_TABLE_SELECTOR, state="attached", timeout=60000)
+        await page.wait_for_selector(result_selector, state="attached", timeout=60000)
     except PlaywrightTimeoutError:
         logger.warning("Result table did not appear within 60s.")
 
@@ -493,10 +525,10 @@ async def next_button_enabled(page) -> bool:
     return disabled_attr is None and "disabled" not in cls.lower()
 
 
-async def table_signature(page) -> str:
-    if await page.locator(RESULT_TABLE_SELECTOR).count() == 0:
+async def table_signature(page, result_selector: str = RESULT_TABLE_SELECTOR) -> str:
+    if await page.locator(result_selector).count() == 0:
         return ""
-    return await page.locator(RESULT_TABLE_SELECTOR).evaluate(
+    return await page.locator(result_selector).evaluate(
         """
         table => {
             const rows = Array.from(table.querySelectorAll('tbody tr'));
@@ -508,10 +540,12 @@ async def table_signature(page) -> str:
     )
 
 
-async def click_next_page(page, logger: logging.Logger) -> None:
+async def click_next_page(page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR) -> bool:
+    """Click "Next 100" and wait for the table to change. Returns True if it
+    changed (a new page loaded), False if it did not (we are at the last page)."""
     await dismiss_sweetalert(page, logger)
 
-    old_sig = await table_signature(page)
+    old_sig = await table_signature(page, result_selector)
 
     await page.click(NEXT_BUTTON_SELECTOR, timeout=30000)
 
@@ -527,25 +561,48 @@ async def click_next_page(page, logger: logging.Logger) -> None:
 
         try:
             if await page.locator("#ddl_State").count() > 0:
-                new_sig = await table_signature(page)
+                new_sig = await table_signature(page, result_selector)
                 if new_sig and new_sig != old_sig:
-                    return
+                    return True
         except Exception:
             pass
 
-    logger.warning("Table signature did not change after Next click; continuing anyway.")
+    logger.warning("Table signature did not change after Next click; treating as last page.")
+    return False
 
 
-async def parse_current_table(page) -> Dict[str, Any]:
+async def parse_current_table(
+    page,
+    result_selector: str = RESULT_TABLE_SELECTOR,
+    layout: str = "legacy",
+) -> Dict[str, Any]:
     """
-    Parse current #GVdataT into wide rows and long score rows.
+    Parse the current results table into {headers, rows}.
+
+    Dispatches on the page layout:
+      - "legacy" (2022-2023, #GVdataT): GP-anchor-first columns with stacked
+        score/grade/band cells.
+      - "flat"   (2023-2024, #GVdata):  State/District/Block/GP/Overall columns
+        followed by per-theme (score, grade) column pairs.
+
+    Both variants return the same row shape so scrape_block stays layout-agnostic:
+        {"gp": {...}, "scores": [...], "wide": {...}}
+    """
+    if layout == "flat":
+        return await parse_table_flat(page, result_selector)
+    return await parse_table_legacy(page, result_selector)
+
+
+async def parse_table_legacy(page, result_selector: str = RESULT_TABLE_SELECTOR) -> Dict[str, Any]:
+    """
+    Parse the legacy 2022-2023 #GVdataT table into wide rows and long score rows.
 
     Important: this is a raw Python string so JS regex literals are not mangled.
     """
-    if await page.locator(RESULT_TABLE_SELECTOR).count() == 0:
+    if await page.locator(result_selector).count() == 0:
         return {"headers": [], "rows": []}
 
-    return await page.locator(RESULT_TABLE_SELECTOR).evaluate(
+    return await page.locator(result_selector).evaluate(
         r"""
         table => {
             const clean = s => (s || '').replace(/\s+/g, ' ').trim();
@@ -648,6 +705,123 @@ async def parse_current_table(page) -> Dict[str, Any]:
     )
 
 
+async def parse_table_flat(page, result_selector: str = "#GVdata") -> Dict[str, Any]:
+    """
+    Parse the 2023-2024 PAI 2.0 #GVdata table.
+
+    Layout (one row per GP):
+        State Name | District Name | Block Name | GP Name | Overall PAI Score |
+        <Theme> | <Theme>-Grade | <Theme> | <Theme>-Grade | ...
+
+    Theme columns come in (score, grade) pairs; grade columns have a header
+    ending in "-Grade". Overall PAI Score is emitted as theme_order 0.
+
+    Returns the same row shape as the legacy parser so scrape_block is unchanged:
+        {"gp": {...}, "scores": [...], "wide": {...}}
+    """
+    if await page.locator(result_selector).count() == 0:
+        return {"headers": [], "rows": []}
+
+    return await page.locator(result_selector).evaluate(
+        r"""
+        table => {
+            const clean = s => (s || '').replace(/\s+/g, ' ').trim();
+
+            const slugify = s => clean(s).toLowerCase()
+                .replace(/[^a-z0-9]+/g, '_')
+                .replace(/^_+|_+$/g, '') || 'field';
+
+            const allRows = Array.from(table.querySelectorAll('tr'));
+            const headerRow = allRows.find(r => r.querySelector('th'));
+            const headers = headerRow
+                ? Array.from(headerRow.querySelectorAll('th')).map(th => clean(th.innerText || th.textContent))
+                : [];
+
+            const lower = headers.map(h => h.toLowerCase());
+            const gpIdx = lower.findIndex(h => h === 'gp name');
+            const overallIdx = lower.findIndex(h => h.includes('overall'));
+
+            // Pair each theme score column with its trailing "-Grade" column.
+            const startIdx = overallIdx >= 0 ? overallIdx + 1 : (gpIdx >= 0 ? gpIdx + 2 : 4);
+            const themeCols = [];
+            for (let i = startIdx; i < headers.length; i++) {
+                if (/-\s*grade\s*$/i.test(headers[i])) {
+                    if (themeCols.length) themeCols[themeCols.length - 1].gradeIdx = i;
+                } else {
+                    themeCols.push({header: headers[i], scoreIdx: i, gradeIdx: -1});
+                }
+            }
+
+            const dataRows = allRows.filter(r => r.querySelector('td'));
+            const rows = [];
+
+            for (const tr of dataRows) {
+                const cells = Array.from(tr.querySelectorAll('td'));
+                if (!cells.length) continue;
+
+                const text = cells.map(c => clean(c.innerText));
+                const rowText = clean(tr.innerText);
+                if (!rowText || /no data/i.test(rowText)) continue;
+
+                const gp_name = gpIdx >= 0 ? (text[gpIdx] || '') : '';
+                if (!gp_name) continue;
+
+                let scorecard_url = '';
+                const a = gpIdx >= 0 && cells[gpIdx] ? cells[gpIdx].querySelector('a') : null;
+                if (a) {
+                    const onclick = a.getAttribute('onclick') || '';
+                    const u = onclick.match(/['"]([^'"]*SC\.aspx[^'"]*)['"]/i);
+                    if (u) scorecard_url = u[1].replace(/&amp;/g, '&');
+                    else if (a.getAttribute('href')) scorecard_url = (a.getAttribute('href') || '').replace(/&amp;/g, '&');
+                }
+
+                const overall = overallIdx >= 0 ? (text[overallIdx] || '') : '';
+
+                const scores = [];
+                if (overallIdx >= 0) {
+                    scores.push({
+                        theme_order: 0,
+                        theme_header: headers[overallIdx],
+                        theme_slug: 'overall_pai_score',
+                        score: overall,
+                        grade: '',
+                        band: '',
+                        raw_value: overall
+                    });
+                }
+                themeCols.forEach((tc, k) => {
+                    const score = text[tc.scoreIdx] || '';
+                    const grade = tc.gradeIdx >= 0 ? (text[tc.gradeIdx] || '') : '';
+                    scores.push({
+                        theme_order: k + 1,
+                        theme_header: tc.header,
+                        theme_slug: slugify(tc.header),
+                        score: score,
+                        grade: grade,
+                        band: '',
+                        raw_value: clean(score + (grade ? ' ' + grade : ''))
+                    });
+                });
+
+                const gp = {gp_name: gp_name, gp_code: '', scorecard_url: scorecard_url, details_raw: gp_name};
+
+                const wide = {...gp};
+                for (const sc of scores) {
+                    wide[`${sc.theme_slug}_score`] = sc.score;
+                    wide[`${sc.theme_slug}_grade`] = sc.grade;
+                    wide[`${sc.theme_slug}_band`] = sc.band;
+                    wide[`${sc.theme_slug}_raw`] = sc.raw_value;
+                }
+
+                rows.push({gp, scores, wide});
+            }
+
+            return {headers, rows};
+        }
+        """
+    )
+
+
 def build_block_dir(out_dir: Path, year: str, state: Dict[str, str], district: Dict[str, str], block: Dict[str, str]) -> Path:
     return (
         out_dir
@@ -732,6 +906,10 @@ async def scrape_block(
     done_json = block_dir / "DONE.json"
     failed_json = block_dir / "FAILED.json"
 
+    conf = YEAR_CONFIGS[year]
+    result_selector = conf["result_table"]
+    layout = conf["layout"]
+
     prior = done_status(block_dir)
     if prior and not args.overwrite:
         prior_status = prior.get("status", "")
@@ -768,7 +946,7 @@ async def scrape_block(
 
     await ensure_state_district(page, state, district, logger)
     await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
-    alert_msg = await click_search(page, logger)
+    alert_msg = await click_search(page, logger, result_selector)
 
     if alert_msg and "not available" in alert_msg.lower():
         logger.info(
@@ -804,6 +982,18 @@ async def scrape_block(
             failed_json.unlink()
         return done_obj
 
+    # Guard against flaky-server false negatives. If the results table never
+    # rendered (common when the PAI server stalls mid-stream) and the server
+    # did not explicitly say "no data", treat this as a retryable failure
+    # rather than silently writing an empty done_no_rows block that future
+    # resumable runs would skip forever.
+    if await page.locator(result_selector).count() == 0:
+        raise RuntimeError(
+            f"Result table {result_selector} did not load for "
+            f"{clean_label(state['text'])} / {clean_label(district['text'])} / "
+            f"{clean_label(block['text'])} (server slow/stalled); will retry"
+        )
+
     all_wide_rows: List[Dict[str, Any]] = []
     all_meta_rows: List[Dict[str, Any]] = []
     all_score_rows: List[Dict[str, Any]] = []
@@ -821,12 +1011,13 @@ async def scrape_block(
     }
 
     page_no = 1
+    prev_sig: Optional[tuple] = None
 
     while True:
         html_path = html_dir / f"page_{page_no:03d}.html"
         await save_html(page, html_path)
 
-        parsed = await parse_current_table(page)
+        parsed = await parse_current_table(page, result_selector, layout)
         rows = parsed.get("rows", [])
 
         logger.info(
@@ -838,6 +1029,13 @@ async def scrape_block(
             page_no,
             len(rows),
         )
+
+        cur_sig = tuple(item["gp"].get("gp_name", "") for item in rows)
+        if page_no > 1 and cur_sig == prev_sig:
+            # Same page as before -> we have paged past the end (the new-format
+            # #btnNext never disables). Stop without re-appending duplicates.
+            break
+        prev_sig = cur_sig
 
         for item in rows:
             gp = item["gp"]
@@ -870,14 +1068,21 @@ async def scrape_block(
                     }
                 )
 
-        if not await next_button_enabled(page):
-            break
+        if layout == "flat":
+            # New page's #btnNext is never disabled; a short page (fewer than
+            # 100 GPs) is the last page, so stop without an extra Next click.
+            if len(rows) < FLAT_PAGE_SIZE:
+                break
+        else:
+            if not await next_button_enabled(page):
+                break
 
         page_no += 1
         if args.max_pages_per_block and page_no > args.max_pages_per_block:
             raise RuntimeError(f"Exceeded --max-pages-per-block={args.max_pages_per_block}")
 
-        await click_next_page(page, logger)
+        if not await click_next_page(page, logger, result_selector):
+            break
 
     write_csv_rows(metadata_csv, all_meta_rows, GP_METADATA_FIELDS)
     write_csv_rows(scores_long_csv, all_score_rows, GP_SCORE_FIELDS)
@@ -942,11 +1147,19 @@ async def reload_to_state_district(
         return None
 
     await select_value(page, "#ddl_State", state["value"], wait_ms=1200)
-    await get_options(page, "#ddl_District", timeout=60)
+    try:
+        await get_options(page, "#ddl_District", timeout=60)
+    except Exception as e:
+        logger.error("[%s] Failed to load districts for %s: %s", year, state["text"], e)
+        return None
 
     if district is not None:
         await select_value(page, "#ddl_District", district["value"], wait_ms=1200)
-        await get_options(page, "#ddl_Block", timeout=60)
+        try:
+            await get_options(page, "#ddl_Block", timeout=60)
+        except Exception as e:
+            logger.error("[%s] Failed to load blocks for %s / %s: %s", year, state["text"], district["text"], e)
+            return None
 
     return page_info
 
@@ -1329,13 +1542,9 @@ async def main_async(args) -> None:
 
         if args.block_third_party:
             async def route_handler(route):
-                url = route.request.url.lower()
-                if (
-                    "googletagmanager" in url
-                    or "google-analytics" in url
-                    or "translation-plugin.bhashini" in url
-                    or "bhashini" in url
-                ):
+                req = route.request
+                url = req.url.lower()
+                if req.resource_type in BLOCKED_RESOURCE_TYPES or any(s in url for s in BLOCKED_URL_SUBSTRINGS):
                     await route.abort()
                 else:
                     await route.continue_()
