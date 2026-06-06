@@ -217,7 +217,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 .DS_Store
-/test_data
+/data
 
 # Release build outputs (published to GitHub Releases / Dataverse, not committed)
 /dist

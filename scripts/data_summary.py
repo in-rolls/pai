@@ -11,7 +11,7 @@ Outputs (also printed as GitHub-flavored Markdown):
     <out>/pai_summary_by_state.csv  one row per (year, state)
 
 Usage:
-    uv run scripts/data_summary.py [--data-dir test_data] [--out docs] [--years 2022-2023 2023-2024]
+    uv run scripts/data_summary.py [--data-dir data] [--out docs] [--years 2022-2023 2023-2024]
 """
 
 import argparse
@@ -185,7 +185,7 @@ def markdown_table(rows: list[dict]) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Tabulate PAI scrape coverage")
-    p.add_argument("--data-dir", default="test_data")
+    p.add_argument("--data-dir", default="data")
     p.add_argument("--out", default="docs")
     p.add_argument("--years", nargs="+", default=YEARS)
     args = p.parse_args()

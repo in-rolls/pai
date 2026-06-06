@@ -3,7 +3,7 @@
 Inspect scraper progress.
 
 Usage:
-  python pai_inspect_output.py --out test_data
+  python pai_inspect_output.py --out data
 """
 
 import argparse
@@ -18,7 +18,7 @@ from pai_common import read_csv  # noqa: E402
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--out", default="test_data")
+    parser.add_argument("--out", default="data")
     args = parser.parse_args()
 
     out = Path(args.out)

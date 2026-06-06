@@ -16,7 +16,7 @@ thematic scores/grades (T1 Poverty-Free … T9 Women-Friendly) per Gram Panchaya
 
 Full per-state breakdown: [`docs/pai_summary_by_state.csv`](docs/pai_summary_by_state.csv)
 (year totals: [`docs/pai_summary.csv`](docs/pai_summary.csv)). Regenerate with
-`python scripts/data_summary.py`.
+`uv run scripts/data_summary.py`.
 
 ### Download — parsed data (GitHub Release [`data-v1`](https://github.com/in-rolls/pai/releases/tag/data-v1))
 
@@ -73,13 +73,20 @@ uv run scripts/pai_scraper_resumable.py --years 2022-2023 2023-2024 --headless -
 
 ## Resume
 
-Run the same command again — blocks with `DONE.json` are skipped. Use `--retry-empty` to
-retry blocks that completed with zero GP rows, or `--overwrite` to rescrape matching blocks.
+Run the same command again — blocks with `DONE.json` are skipped. Retry flags:
+
+- `--retry-empty` — re-do blocks that finished with zero GP rows.
+- `--retry-no-data` — re-verify blocks previously marked "no data available". The server returns an
+  identical "not available" alert both for genuinely empty blocks and (spuriously) under load, so a
+  no-data result is confirmed by re-searching `--no-data-confirm` times (default 2) before it is
+  accepted; if data appears it is recovered, and an indeterminate recheck is retried (never a
+  terminal false negative).
+- `--overwrite` — rescrape matching blocks unconditionally.
 
 ## Outputs
 
 ```text
-test_data/
+data/
 ├── pai_scrape.log
 ├── block_manifest.csv          # append-only scrape log
 ├── dropdown_inventory.csv      # append-only option universe
@@ -100,10 +107,10 @@ The **per-block files are the source of truth.** The consolidated `gp_metadata.c
 inline), so they can never drift or duplicate:
 
 ```bash
-uv run scripts/pai_rebuild_index.py --out test_data   # de-duplicated global indexes
+uv run scripts/pai_rebuild_index.py --out data   # de-duplicated global indexes
 uv run scripts/data_summary.py                        # coverage tables -> docs/pai_summary*.csv
 uv run scripts/scrape_progress.py --year 2023-2024    # progress from block_manifest.csv
-uv run scripts/pai_inspect_output.py --out test_data  # quick counts
+uv run scripts/pai_inspect_output.py --out data  # quick counts
 uv run scripts/build_release.py                       # release archives -> dist/
 ```
 

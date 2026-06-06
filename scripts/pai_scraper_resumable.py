@@ -129,6 +129,22 @@ def is_real_option(option: dict[str, str]) -> bool:
     return not any(bad in low for bad in BAD_OPTION_TEXT)
 
 
+def skip_decision(
+    prior_status: str, prior_rows: int, *, retry_no_data: bool, retry_empty: bool
+) -> str | None:
+    """Decide whether a previously-finished block should be skipped on a resumable run.
+
+    Returns "no_data" (skip a confirmed no-data block), "done" (skip a finished block),
+    or None (re-scrape it). `--retry-no-data` re-verifies no-data blocks; `--retry-empty`
+    re-does zero-row blocks.
+    """
+    if prior_status == "done_no_data_available":
+        return None if retry_no_data else "no_data"
+    if prior_rows > 0 or not retry_empty:
+        return "done"
+    return None
+
+
 def setup_logger(out_dir: Path) -> logging.Logger:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -820,7 +836,13 @@ async def scrape_block(
     if prior and not args.overwrite:
         prior_status = prior.get("status", "")
         prior_rows = int(prior.get("gp_rows", 0) or 0)
-        if prior_status == "done_no_data_available":
+        decision = skip_decision(
+            prior_status,
+            prior_rows,
+            retry_no_data=args.retry_no_data,
+            retry_empty=args.retry_empty,
+        )
+        if decision == "no_data":
             logger.info("Skipping block (no data available): %s", block_dir)
             return {
                 "status": "skipped_no_data",
@@ -833,7 +855,7 @@ async def scrape_block(
                 "score_rows": 0,
                 "error": "",
             }
-        if prior_rows > 0 or not args.retry_empty:
+        if decision == "done":
             logger.info("Skipping done block: %s", block_dir)
             return {
                 "status": "skipped_done",
@@ -857,39 +879,70 @@ async def scrape_block(
     await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
     alert_msg = await click_search(page, logger, result_selector)
 
+    where = (
+        f"{clean_label(state['text'])} / {clean_label(district['text'])} / "
+        f"{clean_label(block['text'])}"
+    )
+
     if alert_msg and "not available" in alert_msg.lower():
-        logger.info(
-            "[%s] %s / %s / %s: No data available (server message)",
-            year,
-            clean_label(state["text"]),
-            clean_label(district["text"]),
-            clean_label(block["text"]),
-        )
-        status = "done_no_data_available"
-        done_obj = {
-            "status": status,
-            "timestamp_utc": utc_now(),
-            "run_id": run_id,
-            "year": year,
-            "state": clean_label(state["text"]),
-            "state_value": state["value"],
-            "district": clean_label(district["text"]),
-            "district_value": district["value"],
-            "block": clean_label(block["text"]),
-            "block_value": block["value"],
-            "block_dir": str(block_dir),
-            "data_wide_csv": str(data_wide_csv),
-            "metadata_csv": str(metadata_csv),
-            "scores_long_csv": str(scores_long_csv),
-            "html_pages": 0,
-            "gp_rows": 0,
-            "score_rows": 0,
-            "server_message": alert_msg,
-        }
-        write_json(done_json, done_obj)
-        if failed_json.exists():
-            failed_json.unlink()
-        return done_obj
+        # The PAI server returns a byte-identical "Details are not available" alert both
+        # for genuinely empty blocks AND (spuriously) under load, so a single response
+        # cannot distinguish the two. Confirm by re-searching: keep "no data" only if it
+        # reproduces; recover if data appears; raise (retry) if the recheck is
+        # indeterminate. A no-data classification must never be a transient false negative.
+        confirmations = 1
+        for attempt in range(1, args.no_data_confirm + 1):
+            await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
+            recheck = await click_search(page, logger, result_selector)
+            if recheck and "not available" in recheck.lower():
+                confirmations += 1
+                logger.info(
+                    "[%s] %s: 'not available' reconfirmed (%s/%s)",
+                    year,
+                    where,
+                    attempt,
+                    args.no_data_confirm,
+                )
+                continue
+            if await page.locator(result_selector).count() > 0:
+                logger.warning(
+                    "[%s] %s: 'not available' did NOT reproduce (recheck %s) -> data "
+                    "present, recovering",
+                    year,
+                    where,
+                    attempt,
+                )
+                alert_msg = None  # treat as data; fall through to parse below
+                break
+            raise RuntimeError(f"Indeterminate no-data recheck for {where} (server stress); retry")
+
+        if alert_msg:  # still "not available" after all confirmations -> genuine
+            logger.info("[%s] %s: No data available (confirmed x%s)", year, where, confirmations)
+            done_obj = {
+                "status": "done_no_data_available",
+                "timestamp_utc": utc_now(),
+                "run_id": run_id,
+                "year": year,
+                "state": clean_label(state["text"]),
+                "state_value": state["value"],
+                "district": clean_label(district["text"]),
+                "district_value": district["value"],
+                "block": clean_label(block["text"]),
+                "block_value": block["value"],
+                "block_dir": str(block_dir),
+                "data_wide_csv": str(data_wide_csv),
+                "metadata_csv": str(metadata_csv),
+                "scores_long_csv": str(scores_long_csv),
+                "html_pages": 0,
+                "gp_rows": 0,
+                "score_rows": 0,
+                "server_message": alert_msg,
+                "confirmations": confirmations,
+            }
+            write_json(done_json, done_obj)
+            if failed_json.exists():
+                failed_json.unlink()
+            return done_obj
 
     # Guard against flaky-server false negatives. If the results table never
     # rendered (common when the PAI server stalls mid-stream) and the server
@@ -1540,7 +1593,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--years", nargs="+", choices=list(YEAR_CONFIGS.keys()), default=list(YEAR_CONFIGS.keys())
     )
-    parser.add_argument("--out", default="test_data")
+    parser.add_argument("--out", default="data")
 
     parser.add_argument("--state-contains", default=None)
     parser.add_argument("--district-contains", default=None)
@@ -1575,6 +1628,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--retry-empty", action="store_true", help="Re-scrape DONE blocks that have zero GP rows."
+    )
+    parser.add_argument(
+        "--retry-no-data",
+        action="store_true",
+        help="Re-scrape blocks previously marked done_no_data_available (re-verify no-data).",
+    )
+    parser.add_argument(
+        "--no-data-confirm",
+        type=int,
+        default=2,
+        help="Times a 'not available' must reproduce on re-search before it is accepted as "
+        "genuine no-data (0 = trust the first response; default 2).",
     )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--stop-on-error", action="store_true")
