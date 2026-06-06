@@ -49,80 +49,69 @@ The rendered HTML for every block page (~11,400 pages) is archived on Dataverse:
 
 ## Install
 
+Uses [uv](https://docs.astral.sh/uv/) (Python ≥ 3.13):
+
 ```bash
-python3 -m venv pai-venv
-source pai-venv/bin/activate
-pip install -r requirements.txt
-python -m playwright install chromium
+uv sync
+uv run playwright install chromium
 ```
 
 ## Smoke test
 
 ```bash
-python scripts/pai_scraper_resumable.py \
-  --years 2022-2023 \
-  --state-contains Bihar \
-  --limit-districts 1 \
-  --limit-blocks 3
+uv run scripts/pai_scraper_resumable.py \
+  --years 2022-2023 --state-contains Bihar --limit-districts 1 --limit-blocks 3
 ```
 
-If Chromium is flaky, try installed Chrome:
-
-```bash
-python scripts/pai_scraper_resumable.py \
-  --years 2022-2023 \
-  --state-contains Bihar \
-  --limit-districts 1 \
-  --limit-blocks 3 \
-  --browser-channel chrome
-```
+If Chromium is flaky, try installed Chrome with `--browser-channel chrome`.
 
 ## Full run
 
 ```bash
-python scripts/pai_scraper_resumable.py \
-  --years 2022-2023 2023-2024 \
-  --headless \
-  --delay 1.5
+uv run scripts/pai_scraper_resumable.py --years 2022-2023 2023-2024 --headless --delay 1.5
 ```
 
 ## Resume
 
-Run the same command again. Blocks with `DONE.json` are skipped.
-
-Use `--retry-empty` to retry blocks that completed with zero GP rows.
-
-Use `--overwrite` to rescrape matching blocks.
+Run the same command again — blocks with `DONE.json` are skipped. Use `--retry-empty` to
+retry blocks that completed with zero GP rows, or `--overwrite` to rescrape matching blocks.
 
 ## Outputs
 
 ```text
 test_data/
 ├── pai_scrape.log
-├── block_manifest.csv
-├── dropdown_inventory.csv
-├── gp_metadata.csv
-├── gp_scores_long.csv
+├── block_manifest.csv          # append-only scrape log
+├── dropdown_inventory.csv      # append-only option universe
 ├── 2022-2023/
 │   └── State__code/District__code/Block__code/
 │       ├── context.json
 │       ├── DONE.json
-│       ├── FAILED.json              # only if failed
+│       ├── FAILED.json          # only if failed
 │       ├── html/page_001.html
-│       ├── data_wide.csv
+│       ├── data_wide.csv        # authoritative per-block data
 │       ├── metadata.csv
 │       └── scores_long.csv
 └── 2023-2024/
 ```
 
-## Rebuild global indexes
+The **per-block files are the source of truth.** The consolidated `gp_metadata.csv` /
+`gp_scores_long.csv` are *generated on demand* from them (the scraper no longer writes them
+inline), so they can never drift or duplicate:
 
 ```bash
-python scripts/pai_rebuild_index.py --out test_data
+uv run scripts/pai_rebuild_index.py --out test_data   # de-duplicated global indexes
+uv run scripts/data_summary.py                        # coverage tables -> docs/pai_summary*.csv
+uv run scripts/scrape_progress.py --year 2023-2024    # progress from block_manifest.csv
+uv run scripts/pai_inspect_output.py --out test_data  # quick counts
+uv run scripts/build_release.py                       # release archives -> dist/
 ```
 
-## Inspect progress
+## Develop
 
 ```bash
-python scripts/pai_inspect_output.py --out test_data
+make sync     # uv sync + chromium
+make format   # ruff format + ruff check --fix
+make lint     # ruff format --check + ruff check
+make test     # pytest
 ```

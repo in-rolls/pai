@@ -18,8 +18,6 @@ Usage:
       [--years 2022-2023 2023-2024] [--skip-html] [--skip-data]
 """
 
-from __future__ import annotations
-
 import argparse
 import csv
 import os
@@ -29,13 +27,17 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import data_summary  # noqa: E402  (sibling script, reused for SUMMARY.md)
-
-csv.field_size_limit(10_000_000)
+from pai_common import (  # noqa: E402
+    DATA_WIDE_CSV,
+    METADATA_CSV,
+    SCORES_LONG_CSV,
+    consolidate_per_block,
+)
 
 # The consolidated dataset (gp_metadata / gp_scores_long / gp_scores_wide) is rebuilt
-# from the per-block files, which are the authoritative current state (overwritten on
-# each scrape). The top-level global CSVs are append-only logs and can carry duplicate
-# rows from multi-run history, so we do NOT use them for the dataset.
+# from the per-block files via pai_common.consolidate_per_block — the authoritative
+# current state (overwritten on each scrape). The top-level global CSVs are append-only
+# logs and can carry duplicate rows from multi-run history, so we do NOT use them.
 
 README_DATA = """PAI Gram Panchayat scores — {year}
 
@@ -72,44 +74,6 @@ Steps:
 5. Copy the dataset **DOI** (e.g. doi:10.7910/DVN/XXXXXX) and paste it into the README "Data"
    section, replacing the `<DATAVERSE_DOI>` placeholder.
 """
-
-
-def concat_per_block(year_dir: Path, fname: str, dst: Path) -> int:
-    """Union-concat every per-block `fname` (e.g. data_wide.csv) under year_dir into one CSV.
-
-    The per-block files are the authoritative current state, so this de-duplicates by
-    construction (one file per block, overwritten on each scrape)."""
-    files = sorted(year_dir.rglob(fname))
-    # pass 1: union header (preserve first-seen order)
-    fields: list[str] = []
-    seen: set[str] = set()
-    for fp in files:
-        try:
-            with fp.open(newline="", encoding="utf-8") as f:
-                hdr = next(csv.reader(f), [])
-        except Exception:
-            continue
-        for c in hdr:
-            if c not in seen:
-                seen.add(c)
-                fields.append(c)
-    if not fields:
-        dst.write_text("", encoding="utf-8")
-        return 0
-    # pass 2: stream rows
-    n = 0
-    with dst.open("w", newline="", encoding="utf-8") as fo:
-        w = csv.DictWriter(fo, fieldnames=fields, extrasaction="ignore", restval="")
-        w.writeheader()
-        for fp in files:
-            try:
-                with fp.open(newline="", encoding="utf-8") as f:
-                    for row in csv.DictReader(f):
-                        w.writerow(row)
-                        n += 1
-            except Exception:
-                continue
-    return n
 
 
 def dedup_global(src: Path, dst: Path, year: str, key_cols: list[str]) -> int:
@@ -152,13 +116,11 @@ def build_data_archive(data_dir: Path, out: Path, year: str) -> Path:
     cons.mkdir(parents=True, exist_ok=True)
 
     print(f"  [{year}] consolidating per-block files (de-duplicated current state) ...")
-    m = concat_per_block(year_dir, "metadata.csv", cons / f"gp_metadata_{year}.csv")
+    m = consolidate_per_block(year_dir, METADATA_CSV, cons / f"gp_metadata_{year}.csv")
     print(f"    gp_metadata_{year}.csv: {m:,} rows")
-    s = concat_per_block(
-        year_dir, "scores_long.csv", cons / f"gp_scores_long_{year}.csv"
-    )
+    s = consolidate_per_block(year_dir, SCORES_LONG_CSV, cons / f"gp_scores_long_{year}.csv")
     print(f"    gp_scores_long_{year}.csv: {s:,} rows")
-    w = concat_per_block(year_dir, "data_wide.csv", cons / f"gp_scores_wide_{year}.csv")
+    w = consolidate_per_block(year_dir, DATA_WIDE_CSV, cons / f"gp_scores_wide_{year}.csv")
     print(f"    gp_scores_wide_{year}.csv: {w:,} rows")
     bm = dedup_global(
         data_dir / "block_manifest.csv",
@@ -176,14 +138,10 @@ def build_data_archive(data_dir: Path, out: Path, year: str) -> Path:
     print(f"    dropdown_inventory_{year}.csv: {di:,} options")
 
     (stage / "SUMMARY.md").write_text(make_summary_md(data_dir, year), encoding="utf-8")
-    (stage / "README_data.txt").write_text(
-        README_DATA.format(year=year), encoding="utf-8"
-    )
+    (stage / "README_data.txt").write_text(README_DATA.format(year=year), encoding="utf-8")
 
     archive = out / f"pai_{year}_data.tar.gz"
-    print(
-        f"  [{year}] writing {archive.name} (consolidated + blocks, excluding html/debug) ..."
-    )
+    print(f"  [{year}] writing {archive.name} (consolidated + blocks, excluding html/debug) ...")
     n_block_files = 0
     with tarfile.open(archive, "w:gz") as tar:
         # consolidated + docs
@@ -212,9 +170,7 @@ def build_html_archive(data_dir: Path, out: Path, year: str) -> Path:
     n = 0
     with tarfile.open(archive, "w:gz") as tar:
         for fp in sorted(year_dir.rglob("*.html")):
-            tar.add(
-                fp, arcname=str(Path(f"pai_{year}_html") / fp.relative_to(year_dir))
-            )
+            tar.add(fp, arcname=str(Path(f"pai_{year}_html") / fp.relative_to(year_dir)))
             n += 1
     print(f"    added {n:,} html pages")
     return archive
@@ -225,12 +181,8 @@ def main() -> int:
     ap.add_argument("--data-dir", default="test_data")
     ap.add_argument("--out", default="dist")
     ap.add_argument("--years", nargs="+", default=["2022-2023", "2023-2024"])
-    ap.add_argument(
-        "--skip-html", action="store_true", help="Skip the (large) Dataverse HTML zips"
-    )
-    ap.add_argument(
-        "--skip-data", action="store_true", help="Skip the GitHub data tar.gz"
-    )
+    ap.add_argument("--skip-html", action="store_true", help="Skip the (large) Dataverse HTML zips")
+    ap.add_argument("--skip-data", action="store_true", help="Skip the GitHub data tar.gz")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -245,14 +197,12 @@ def main() -> int:
         print(f"=== {year} ===")
         if not args.skip_data:
             a = build_data_archive(data_dir, out, year)
-            print(f"  -> {a}  ({a.stat().st_size/1048576:.1f} MB)")
+            print(f"  -> {a}  ({a.stat().st_size / 1048576:.1f} MB)")
         if not args.skip_html:
             h = build_html_archive(data_dir, out, year)
-            print(f"  -> {h}  ({h.stat().st_size/1048576:.1f} MB)")
+            print(f"  -> {h}  ({h.stat().st_size / 1048576:.1f} MB)")
 
-    print(
-        f"\nDone. Artifacts in {out}/ ; Dataverse steps in {out / 'DATAVERSE_UPLOAD.md'}"
-    )
+    print(f"\nDone. Artifacts in {out}/ ; Dataverse steps in {out / 'DATAVERSE_UPLOAD.md'}")
     return 0
 
 

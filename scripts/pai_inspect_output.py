@@ -6,19 +6,14 @@ Usage:
   python pai_inspect_output.py --out test_data
 """
 
-from __future__ import annotations
-
 import argparse
-import csv
+import os
+import sys
 from collections import Counter
 from pathlib import Path
 
-
-def read_csv(path: Path):
-    if not path.exists():
-        return []
-    with path.open("r", newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pai_common import read_csv  # noqa: E402
 
 
 def main() -> None:

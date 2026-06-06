@@ -5,68 +5,52 @@ Resumable scraper for PAI Gram Panchayat score pages.
 Core behavior:
 - Iterates PAI year -> State/UT -> District -> Block.
 - Saves rendered block-level HTML pages.
-- Parses #GVdataT directly from the rendered page.
-- Follows the "Next 100" pagination button until disabled.
-- Writes per-block outputs and global indexes.
+- Parses the results table (#GVdataT legacy / #GVdata flat) from the rendered page.
+- Follows the "Next 100" pagination button to the last page.
+- Writes per-block outputs (the source of truth; global indexes are rebuilt separately
+  via pai_rebuild_index.py).
 - Resumes by skipping blocks with DONE.json.
 - Records failures and continues instead of crashing.
 
 Install:
-  python3 -m venv pai-venv
-  source pai-venv/bin/activate
-  pip install -r requirements.txt
-  python -m playwright install chromium
+  uv sync && uv run playwright install chromium
 
 Smoke test:
-  python pai_scraper_resumable.py \
-    --years 2022-2023 \
-    --state-contains Bihar \
-    --limit-districts 1 \
-    --limit-blocks 3
+  uv run scripts/pai_scraper_resumable.py \
+    --years 2022-2023 --state-contains Bihar --limit-districts 1 --limit-blocks 3
 
 Full run:
-  python pai_scraper_resumable.py \
-    --years 2022-2023 2023-2024 \
-    --headless \
-    --delay 1.5
+  uv run scripts/pai_scraper_resumable.py --years 2022-2023 2023-2024 --headless --delay 1.5
 """
-
-from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
-import json
 import logging
+import os
 import re
 import sys
 import traceback
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from tqdm import tqdm
 
-
-YEAR_CONFIGS = {
-    "2022-2023": {
-        "url": "https://pai.gov.in/PS/Public/TW-GP.aspx?s=1",
-        "expected_fy_value": "1",
-        # Legacy PAI 1.0 page: results in #GVdataT, GP-anchor-first layout.
-        "result_table": "#GVdataT",
-        "layout": "legacy",
-    },
-    "2023-2024": {
-        "url": "https://pai.gov.in/PS/Public/TW-GP-New.aspx?s=2",
-        "expected_fy_value": "2",
-        # PAI 2.0 "New" page: results in #GVdata, flat State/District/Block/GP
-        # /Overall + per-theme (score, grade) columns.
-        "result_table": "#GVdata",
-        "layout": "flat",
-    },
-}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pai_common import (  # noqa: E402
+    BLOCK_MANIFEST_FIELDS,
+    DROPDOWN_INVENTORY_FIELDS,
+    FLAT_PAGE_SIZE,
+    GP_METADATA_FIELDS,
+    GP_SCORE_FIELDS,
+    YEAR_CONFIGS,
+    append_csv_rows,
+    read_json,
+    write_csv_rows,
+    write_json,
+)
 
 # Default selector for the legacy (2022-2023) page. The 2023-2024 path passes
 # its own selector/layout explicitly via YEAR_CONFIGS.
@@ -92,11 +76,12 @@ BLOCKED_RESOURCE_TYPES = ("image", "font", "media")
 
 # The results table paginates 100 GPs per "Next 100 >>" click. On the 2023-2024
 # (flat) page the server never marks #btnNext disabled, so we detect the last
-# page by a short page (fewer than 100 rows) plus a table-change check.
-FLAT_PAGE_SIZE = 100
+# page by a short page (fewer than FLAT_PAGE_SIZE rows) plus a table-change check.
 NEXT_BUTTON_SELECTOR = "#btnNext"
 SWEETALERT_OVERLAY_SELECTOR = ".sweet-overlay"
-SWEETALERT_CONFIRM_SELECTOR = ".sweet-alert button.confirm, .sweet-alert .sa-confirm-button-container button"
+SWEETALERT_CONFIRM_SELECTOR = (
+    ".sweet-alert button.confirm, .sweet-alert .sa-confirm-button-container button"
+)
 
 BAD_OPTION_TEXT = (
     "-select-",
@@ -107,79 +92,9 @@ BAD_OPTION_TEXT = (
     "चुनें",
 )
 
-BLOCK_MANIFEST_FIELDS = [
-    "run_id",
-    "timestamp_utc",
-    "year",
-    "status",
-    "state",
-    "state_value",
-    "district",
-    "district_value",
-    "block",
-    "block_value",
-    "block_dir",
-    "data_wide_csv",
-    "metadata_csv",
-    "scores_long_csv",
-    "html_pages",
-    "gp_rows",
-    "score_rows",
-    "page_url",
-    "page_title",
-    "page_heading",
-    "actual_fy_value",
-    "expected_fy_value",
-    "error",
-]
-
-DROPDOWN_INVENTORY_FIELDS = [
-    "run_id",
-    "timestamp_utc",
-    "year",
-    "level",
-    "state",
-    "state_value",
-    "district",
-    "district_value",
-    "option_text",
-    "option_value",
-]
-
-GP_METADATA_FIELDS = [
-    "run_id",
-    "timestamp_utc",
-    "year",
-    "state",
-    "state_value",
-    "district",
-    "district_value",
-    "block",
-    "block_value",
-    "gp_name",
-    "gp_code",
-    "scorecard_url",
-    "details_raw",
-    "block_page",
-    "block_dir",
-    "block_data_wide_csv",
-    "block_html_file",
-    "source_url",
-]
-
-GP_SCORE_FIELDS = GP_METADATA_FIELDS + [
-    "theme_order",
-    "theme_header",
-    "theme_slug",
-    "score",
-    "grade",
-    "band",
-    "raw_value",
-]
-
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def clean_label(text: str) -> str:
@@ -196,12 +111,12 @@ def safe_component(text: str, fallback: str, max_len: int = 90) -> str:
     return text or fallback
 
 
-def option_label_with_code(option: Dict[str, str], fallback_prefix: str) -> str:
+def option_label_with_code(option: dict[str, str], fallback_prefix: str) -> str:
     label = safe_component(option["text"], fallback_prefix)
     return f"{label}__{option['value']}"
 
 
-def is_real_option(option: Dict[str, str]) -> bool:
+def is_real_option(option: dict[str, str]) -> bool:
     text = (option.get("text") or "").strip()
     value = (option.get("value") or "").strip()
 
@@ -212,47 +127,6 @@ def is_real_option(option: Dict[str, str]) -> bool:
 
     low = text.lower()
     return not any(bad in low for bad in BAD_OPTION_TEXT)
-
-
-def append_csv_rows(path: Path, rows: List[Dict[str, Any]], fieldnames: List[str]) -> None:
-    if not rows:
-        return
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if not exists:
-            writer.writeheader()
-        writer.writerows(rows)
-
-
-def write_csv_rows(path: Path, rows: List[Dict[str, Any]], fieldnames: Optional[List[str]] = None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if fieldnames is None:
-        keys: List[str] = []
-        for row in rows:
-            for k in row.keys():
-                if k not in keys:
-                    keys.append(k)
-        fieldnames = keys
-
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        if rows:
-            writer.writerows(rows)
-
-
-def write_json(path: Path, obj: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def read_json(path: Path) -> Dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def setup_logger(out_dir: Path) -> logging.Logger:
@@ -275,7 +149,7 @@ def setup_logger(out_dir: Path) -> logging.Logger:
     return logger
 
 
-async def dismiss_sweetalert(page, logger: logging.Logger) -> Optional[str]:
+async def dismiss_sweetalert(page, logger: logging.Logger) -> str | None:
     """
     Dismiss any visible SweetAlert modal and return the message text if one was found.
     Returns None if no modal was visible.
@@ -307,7 +181,10 @@ async def dismiss_sweetalert(page, logger: logging.Logger) -> Optional[str]:
 
         await overlay.click(timeout=5000)
         await page.wait_for_timeout(500)
-        logger.info("Dismissed SweetAlert by clicking overlay: %s", message[:100] if message else "(no message)")
+        logger.info(
+            "Dismissed SweetAlert by clicking overlay: %s",
+            message[:100] if message else "(no message)",
+        )
         return message
 
     except Exception as e:
@@ -315,7 +192,7 @@ async def dismiss_sweetalert(page, logger: logging.Logger) -> Optional[str]:
         return None
 
 
-async def get_options(page, selector: str, timeout: int = 60) -> List[Dict[str, str]]:
+async def get_options(page, selector: str, timeout: int = 60) -> list[dict[str, str]]:
     start = asyncio.get_event_loop().time()
 
     while True:
@@ -362,7 +239,7 @@ async def goto_pai_form(page, url: str, logger: logging.Logger) -> bool:
     Do not wait for full domcontentloaded because third-party scripts can stall.
     Return False instead of raising so the scraper can record and continue.
     """
-    last_error: Optional[Exception] = None
+    last_error: Exception | None = None
 
     for attempt in range(1, 4):
         logger.info("Navigating attempt %s/3: %s", attempt, url)
@@ -408,7 +285,7 @@ async def load_year_page(
     year: str,
     logger: logging.Logger,
     allow_year_mismatch: bool = False,
-) -> Optional[Dict[str, str]]:
+) -> dict[str, str] | None:
     conf = YEAR_CONFIGS[year]
     logger.info("Loading %s page: %s", year, conf["url"])
 
@@ -426,7 +303,9 @@ async def load_year_page(
 
     logger.info("Loaded: url=%s", info["page_url"])
     logger.info("Heading: %s", info["page_heading"])
-    logger.info("FY value: actual=%s expected=%s", info["actual_fy_value"], info["expected_fy_value"])
+    logger.info(
+        "FY value: actual=%s expected=%s", info["actual_fy_value"], info["expected_fy_value"]
+    )
 
     if info["actual_fy_value"] and info["actual_fy_value"] != info["expected_fy_value"]:
         msg = (
@@ -443,7 +322,9 @@ async def load_year_page(
     return info
 
 
-async def ensure_state_district(page, state: Dict[str, str], district: Dict[str, str], logger: logging.Logger) -> None:
+async def ensure_state_district(
+    page, state: dict[str, str], district: dict[str, str], logger: logging.Logger
+) -> None:
     await dismiss_sweetalert(page, logger)
     await page.wait_for_selector("#ddl_State", state="attached", timeout=60000)
 
@@ -458,7 +339,9 @@ async def ensure_state_district(page, state: Dict[str, str], district: Dict[str,
         await get_options(page, "#ddl_Block", timeout=60)
 
 
-async def click_search(page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR) -> Optional[str]:
+async def click_search(
+    page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR
+) -> str | None:
     """
     Click search and wait for results or a SweetAlert.
     Returns the SweetAlert message if one appeared (e.g., "Details are not available"),
@@ -540,7 +423,9 @@ async def table_signature(page, result_selector: str = RESULT_TABLE_SELECTOR) ->
     )
 
 
-async def click_next_page(page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR) -> bool:
+async def click_next_page(
+    page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR
+) -> bool:
     """Click "Next 100" and wait for the table to change. Returns True if it
     changed (a new page loaded), False if it did not (we are at the last page)."""
     await dismiss_sweetalert(page, logger)
@@ -575,7 +460,7 @@ async def parse_current_table(
     page,
     result_selector: str = RESULT_TABLE_SELECTOR,
     layout: str = "legacy",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     Parse the current results table into {headers, rows}.
 
@@ -593,7 +478,7 @@ async def parse_current_table(
     return await parse_table_legacy(page, result_selector)
 
 
-async def parse_table_legacy(page, result_selector: str = RESULT_TABLE_SELECTOR) -> Dict[str, Any]:
+async def parse_table_legacy(page, result_selector: str = RESULT_TABLE_SELECTOR) -> dict[str, Any]:
     """
     Parse the legacy 2022-2023 #GVdataT table into wide rows and long score rows.
 
@@ -705,7 +590,7 @@ async def parse_table_legacy(page, result_selector: str = RESULT_TABLE_SELECTOR)
     )
 
 
-async def parse_table_flat(page, result_selector: str = "#GVdata") -> Dict[str, Any]:
+async def parse_table_flat(page, result_selector: str = "#GVdata") -> dict[str, Any]:
     """
     Parse the 2023-2024 PAI 2.0 #GVdata table.
 
@@ -734,7 +619,8 @@ async def parse_table_flat(page, result_selector: str = "#GVdata") -> Dict[str, 
             const allRows = Array.from(table.querySelectorAll('tr'));
             const headerRow = allRows.find(r => r.querySelector('th'));
             const headers = headerRow
-                ? Array.from(headerRow.querySelectorAll('th')).map(th => clean(th.innerText || th.textContent))
+                ? Array.from(headerRow.querySelectorAll('th')).map(
+                      th => clean(th.innerText || th.textContent))
                 : [];
 
             const lower = headers.map(h => h.toLowerCase());
@@ -772,7 +658,8 @@ async def parse_table_flat(page, result_selector: str = "#GVdata") -> Dict[str, 
                     const onclick = a.getAttribute('onclick') || '';
                     const u = onclick.match(/['"]([^'"]*SC\.aspx[^'"]*)['"]/i);
                     if (u) scorecard_url = u[1].replace(/&amp;/g, '&');
-                    else if (a.getAttribute('href')) scorecard_url = (a.getAttribute('href') || '').replace(/&amp;/g, '&');
+                    else if (a.getAttribute('href'))
+                        scorecard_url = (a.getAttribute('href') || '').replace(/&amp;/g, '&');
                 }
 
                 const overall = overallIdx >= 0 ? (text[overallIdx] || '') : '';
@@ -803,7 +690,12 @@ async def parse_table_flat(page, result_selector: str = "#GVdata") -> Dict[str, 
                     });
                 });
 
-                const gp = {gp_name: gp_name, gp_code: '', scorecard_url: scorecard_url, details_raw: gp_name};
+                const gp = {
+                    gp_name: gp_name,
+                    gp_code: '',
+                    scorecard_url: scorecard_url,
+                    details_raw: gp_name,
+                };
 
                 const wide = {...gp};
                 for (const sc of scores) {
@@ -822,7 +714,9 @@ async def parse_table_flat(page, result_selector: str = "#GVdata") -> Dict[str, 
     )
 
 
-def build_block_dir(out_dir: Path, year: str, state: Dict[str, str], district: Dict[str, str], block: Dict[str, str]) -> Path:
+def build_block_dir(
+    out_dir: Path, year: str, state: dict[str, str], district: dict[str, str], block: dict[str, str]
+) -> Path:
     return (
         out_dir
         / year
@@ -832,7 +726,7 @@ def build_block_dir(out_dir: Path, year: str, state: Dict[str, str], district: D
     )
 
 
-def done_status(block_dir: Path) -> Optional[Dict[str, Any]]:
+def done_status(block_dir: Path) -> dict[str, Any] | None:
     done = block_dir / "DONE.json"
     if done.exists():
         try:
@@ -845,33 +739,45 @@ def done_status(block_dir: Path) -> Optional[Dict[str, Any]]:
 def context_obj(
     run_id: str,
     year: str,
-    page_info: Dict[str, str],
-    state: Dict[str, str],
-    district: Dict[str, str],
-    block: Dict[str, str],
+    page_info: dict[str, str],
+    state: dict[str, str],
+    district: dict[str, str],
+    block: dict[str, str],
     block_dir: Path,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         "run_id": run_id,
         "timestamp_utc": utc_now(),
         "year": year,
         "page_info": page_info,
-        "state": {"text": clean_label(state["text"]), "value": state["value"], "raw_text": state["text"]},
-        "district": {"text": clean_label(district["text"]), "value": district["value"], "raw_text": district["text"]},
-        "block": {"text": clean_label(block["text"]), "value": block["value"], "raw_text": block["text"]},
+        "state": {
+            "text": clean_label(state["text"]),
+            "value": state["value"],
+            "raw_text": state["text"],
+        },
+        "district": {
+            "text": clean_label(district["text"]),
+            "value": district["value"],
+            "raw_text": district["text"],
+        },
+        "block": {
+            "text": clean_label(block["text"]),
+            "value": block["value"],
+            "raw_text": block["text"],
+        },
         "block_dir": str(block_dir),
     }
 
 
 def enrich_metadata_row(
-    base: Dict[str, Any],
-    gp: Dict[str, Any],
+    base: dict[str, Any],
+    gp: dict[str, Any],
     block_page: int,
     block_dir: Path,
     data_wide_csv: Path,
     html_file: Path,
     source_url: str,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return {
         **base,
         "gp_name": gp.get("gp_name", ""),
@@ -889,15 +795,15 @@ def enrich_metadata_row(
 async def scrape_block(
     page,
     year: str,
-    page_info: Dict[str, str],
-    state: Dict[str, str],
-    district: Dict[str, str],
-    block: Dict[str, str],
+    page_info: dict[str, str],
+    state: dict[str, str],
+    district: dict[str, str],
+    block: dict[str, str],
     out_dir: Path,
     run_id: str,
     args,
     logger: logging.Logger,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     block_dir = build_block_dir(out_dir, year, state, district, block)
     html_dir = block_dir / "html"
     data_wide_csv = block_dir / "data_wide.csv"
@@ -942,7 +848,10 @@ async def scrape_block(
             }
 
     block_dir.mkdir(parents=True, exist_ok=True)
-    write_json(block_dir / "context.json", context_obj(run_id, year, page_info, state, district, block, block_dir))
+    write_json(
+        block_dir / "context.json",
+        context_obj(run_id, year, page_info, state, district, block, block_dir),
+    )
 
     await ensure_state_district(page, state, district, logger)
     await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
@@ -994,9 +903,9 @@ async def scrape_block(
             f"{clean_label(block['text'])} (server slow/stalled); will retry"
         )
 
-    all_wide_rows: List[Dict[str, Any]] = []
-    all_meta_rows: List[Dict[str, Any]] = []
-    all_score_rows: List[Dict[str, Any]] = []
+    all_wide_rows: list[dict[str, Any]] = []
+    all_meta_rows: list[dict[str, Any]] = []
+    all_score_rows: list[dict[str, Any]] = []
 
     base_meta = {
         "run_id": run_id,
@@ -1011,7 +920,7 @@ async def scrape_block(
     }
 
     page_no = 1
-    prev_sig: Optional[tuple] = None
+    prev_sig: tuple | None = None
 
     while True:
         html_path = html_dir / f"page_{page_no:03d}.html"
@@ -1117,10 +1026,10 @@ async def scrape_block(
 
 
 def filter_options(
-    options: List[Dict[str, str]],
-    contains: Optional[str],
-    values: Optional[List[str]],
-) -> List[Dict[str, str]]:
+    options: list[dict[str, str]],
+    contains: str | None,
+    values: list[str] | None,
+) -> list[dict[str, str]]:
     out = options
 
     if contains:
@@ -1137,11 +1046,11 @@ def filter_options(
 async def reload_to_state_district(
     page,
     year: str,
-    state: Dict[str, str],
-    district: Optional[Dict[str, str]],
+    state: dict[str, str],
+    district: dict[str, str] | None,
     args,
     logger: logging.Logger,
-) -> Optional[Dict[str, str]]:
+) -> dict[str, str] | None:
     page_info = await load_year_page(page, year, logger, args.allow_year_mismatch)
     if not page_info:
         return None
@@ -1158,7 +1067,13 @@ async def reload_to_state_district(
         try:
             await get_options(page, "#ddl_Block", timeout=60)
         except Exception as e:
-            logger.error("[%s] Failed to load blocks for %s / %s: %s", year, state["text"], district["text"], e)
+            logger.error(
+                "[%s] Failed to load blocks for %s / %s: %s",
+                year,
+                state["text"],
+                district["text"],
+                e,
+            )
             return None
 
     return page_info
@@ -1174,8 +1089,6 @@ async def scrape_year(
 ) -> None:
     block_manifest_path = out_dir / "block_manifest.csv"
     dropdown_inventory_path = out_dir / "dropdown_inventory.csv"
-    global_metadata_path = out_dir / "gp_metadata.csv"
-    global_scores_path = out_dir / "gp_scores_long.csv"
 
     page_info = await load_year_page(page, year, logger, args.allow_year_mismatch)
     if not page_info:
@@ -1310,9 +1223,23 @@ async def scrape_year(
 
         logger.info("[%s] Districts in %s: %s", year, clean_label(state["text"]), len(districts))
 
-        districts_pbar = tqdm(districts, desc=f"  Districts", unit="dist", position=1, leave=False)
+        districts_pbar = tqdm(districts, desc="  Districts", unit="dist", position=1, leave=False)
         for district in districts_pbar:
             districts_pbar.set_postfix_str(clean_label(district["text"])[:25])
+
+            # A failed block earlier in this state may have left page_info=None after
+            # a failed reload; re-establish it before using it for the manifest.
+            if page_info is None:
+                page_info = await reload_to_state_district(
+                    page, year, state, district, args, logger
+                )
+                if page_info is None:
+                    logger.error(
+                        "[%s] Could not reload page for %s; skipping remaining districts.",
+                        year,
+                        state["text"],
+                    )
+                    break
 
             try:
                 await ensure_state_district(page, state, district, logger)
@@ -1359,11 +1286,14 @@ async def scrape_year(
                 len(blocks),
             )
 
-            blocks_pbar = tqdm(blocks, desc=f"    Blocks", unit="block", position=2, leave=False)
+            blocks_pbar = tqdm(blocks, desc="    Blocks", unit="block", position=2, leave=False)
             for block in blocks_pbar:
                 block_dir = build_block_dir(out_dir, year, state, district, block)
                 blocks_pbar.set_postfix_str(clean_label(block["text"])[:20])
 
+                # Invariant: page_info is non-None here — the district-level guard
+                # reloads it, and any in-loop reload that fails breaks the loop.
+                assert page_info is not None
                 manifest_base = {
                     "run_id": run_id,
                     "timestamp_utc": utc_now(),
@@ -1418,20 +1348,6 @@ async def scrape_year(
                             BLOCK_MANIFEST_FIELDS,
                         )
 
-                        if result.get("status") in {"done", "done_no_rows"}:
-                            metadata_csv = Path(result["metadata_csv"])
-                            scores_csv = Path(result["scores_long_csv"])
-
-                            if metadata_csv.exists():
-                                with metadata_csv.open("r", newline="", encoding="utf-8") as f:
-                                    rows = list(csv.DictReader(f))
-                                append_csv_rows(global_metadata_path, rows, GP_METADATA_FIELDS)
-
-                            if scores_csv.exists():
-                                with scores_csv.open("r", newline="", encoding="utf-8") as f:
-                                    rows = list(csv.DictReader(f))
-                                append_csv_rows(global_scores_path, rows, GP_SCORE_FIELDS)
-
                         success_or_skip = True
                         break
 
@@ -1460,12 +1376,17 @@ async def scrape_year(
                             debug_dir = block_dir / "debug"
                             debug_dir.mkdir(parents=True, exist_ok=True)
                             await save_html(page, debug_dir / f"failed_attempt_{attempt}.html")
-                            await page.screenshot(path=str(debug_dir / f"failed_attempt_{attempt}.png"), full_page=True)
+                            await page.screenshot(
+                                path=str(debug_dir / f"failed_attempt_{attempt}.png"),
+                                full_page=True,
+                            )
                         except Exception:
                             pass
 
                         if attempt < args.max_retries:
-                            page_info = await reload_to_state_district(page, year, state, district, args, logger)
+                            page_info = await reload_to_state_district(
+                                page, year, state, district, args, logger
+                            )
                             if not page_info:
                                 break
 
@@ -1492,9 +1413,14 @@ async def scrape_year(
                     if args.stop_on_error:
                         raise RuntimeError(f"Failed block after retries: {block['text']}")
 
-                    page_info = await reload_to_state_district(page, year, state, district, args, logger)
+                    page_info = await reload_to_state_district(
+                        page, year, state, district, args, logger
+                    )
                     if not page_info:
-                        logger.error("[%s] Could not recover page after failed block; moving to next state.", year)
+                        logger.error(
+                            "[%s] Could not recover page after failed block; moving to next state.",
+                            year,
+                        )
                         break
 
                 await page.wait_for_timeout(int(args.delay * 1000))
@@ -1541,10 +1467,13 @@ async def main_async(args) -> None:
         page = await context.new_page()
 
         if args.block_third_party:
+
             async def route_handler(route):
                 req = route.request
                 url = req.url.lower()
-                if req.resource_type in BLOCKED_RESOURCE_TYPES or any(s in url for s in BLOCKED_URL_SUBSTRINGS):
+                if req.resource_type in BLOCKED_RESOURCE_TYPES or any(
+                    s in url for s in BLOCKED_URL_SUBSTRINGS
+                ):
                     await route.abort()
                 else:
                     await route.continue_()
@@ -1595,12 +1524,11 @@ async def main_async(args) -> None:
         await browser.close()
 
     logger.info("Done.")
-    logger.info("Global metadata: %s", (out_dir / "gp_metadata.csv").resolve())
-    logger.info("Global scores:   %s", (out_dir / "gp_scores_long.csv").resolve())
-    logger.info("Manifest:        %s", (out_dir / "block_manifest.csv").resolve())
+    logger.info("Manifest: %s", (out_dir / "block_manifest.csv").resolve())
+    logger.info("Rebuild global gp_metadata/gp_scores_long with: scripts/pai_rebuild_index.py")
 
 
-def comma_values(value: Optional[str]) -> Optional[List[str]]:
+def comma_values(value: str | None) -> list[str] | None:
     if not value:
         return None
     return [x.strip() for x in value.split(",") if x.strip()]
@@ -1609,24 +1537,45 @@ def comma_values(value: Optional[str]) -> Optional[List[str]]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--years", nargs="+", choices=list(YEAR_CONFIGS.keys()), default=list(YEAR_CONFIGS.keys()))
+    parser.add_argument(
+        "--years", nargs="+", choices=list(YEAR_CONFIGS.keys()), default=list(YEAR_CONFIGS.keys())
+    )
     parser.add_argument("--out", default="test_data")
 
     parser.add_argument("--state-contains", default=None)
     parser.add_argument("--district-contains", default=None)
     parser.add_argument("--block-contains", default=None)
 
-    parser.add_argument("--state-values", type=comma_values, default=None, help="Comma-separated state option values, e.g. 10,9")
-    parser.add_argument("--district-values", type=comma_values, default=None, help="Comma-separated district option values")
-    parser.add_argument("--block-values", type=comma_values, default=None, help="Comma-separated block option values")
+    parser.add_argument(
+        "--state-values",
+        type=comma_values,
+        default=None,
+        help="Comma-separated state option values, e.g. 10,9",
+    )
+    parser.add_argument(
+        "--district-values",
+        type=comma_values,
+        default=None,
+        help="Comma-separated district option values",
+    )
+    parser.add_argument(
+        "--block-values",
+        type=comma_values,
+        default=None,
+        help="Comma-separated block option values",
+    )
 
     parser.add_argument("--limit-states", type=int, default=None)
     parser.add_argument("--limit-districts", type=int, default=None)
     parser.add_argument("--limit-blocks", type=int, default=None)
     parser.add_argument("--max-pages-per-block", type=int, default=1000)
 
-    parser.add_argument("--overwrite", action="store_true", help="Re-scrape blocks even when DONE.json exists.")
-    parser.add_argument("--retry-empty", action="store_true", help="Re-scrape DONE blocks that have zero GP rows.")
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Re-scrape blocks even when DONE.json exists."
+    )
+    parser.add_argument(
+        "--retry-empty", action="store_true", help="Re-scrape DONE blocks that have zero GP rows."
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--stop-on-error", action="store_true")
 
