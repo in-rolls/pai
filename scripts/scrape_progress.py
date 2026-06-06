@@ -7,19 +7,18 @@ Usage:
 """
 
 import argparse
-import csv
+import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 
-
-def load_manifest(manifest_path: Path) -> list[dict]:
-    """Load and parse block_manifest.csv"""
-    rows = []
-    with open(manifest_path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-    return rows
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pai_common import (  # noqa: E402
+    MANIFEST_FAILED,
+    MANIFEST_NO_DATA,
+    MANIFEST_SUCCESS,
+    read_csv,
+)
 
 
 def analyze_progress(rows: list[dict], year: str | None = None) -> dict:
@@ -34,18 +33,10 @@ def analyze_progress(rows: list[dict], year: str | None = None) -> dict:
         if block_dir:
             block_status[block_dir] = row
 
-    # Categorize statuses
-    # "skipped_done" means CSV already exists - count as successful
-    success_statuses = {"done", "skipped_done"}
-    no_data_statuses = {"done_no_data_available", "done_no_rows", "skipped_no_data"}
-    failed_statuses = {
-        "block_failed",
-        "district_dropdown_failed",
-        "failed",
-        "state_page_load_failed",
-        "year_crashed",
-        "year_page_load_failed",
-    }
+    # Categorize statuses (shared buckets; "skipped_*" mark resumable re-runs).
+    success_statuses = MANIFEST_SUCCESS
+    no_data_statuses = MANIFEST_NO_DATA
+    failed_statuses = MANIFEST_FAILED
 
     results = {
         "successful": [],
@@ -54,7 +45,7 @@ def analyze_progress(rows: list[dict], year: str | None = None) -> dict:
         "other": [],
     }
 
-    for block_dir, row in block_status.items():
+    for row in block_status.values():
         status = row["status"]
         if status in success_statuses:
             results["successful"].append(row)
@@ -150,12 +141,8 @@ def check_csvs_on_disk(data_dir: Path, year: str) -> int:
 def main():
     parser = argparse.ArgumentParser(description="Analyze PAI scraping progress")
     parser.add_argument("--year", default="2022-2023", help="Year to analyze")
-    parser.add_argument(
-        "--detailed", action="store_true", help="Show detailed state coverage"
-    )
-    parser.add_argument(
-        "--failed", action="store_true", help="Show failed blocks by state"
-    )
+    parser.add_argument("--detailed", action="store_true", help="Show detailed state coverage")
+    parser.add_argument("--failed", action="store_true", help="Show failed blocks by state")
     args = parser.parse_args()
 
     base_dir = Path(__file__).parent.parent
@@ -166,7 +153,7 @@ def main():
         print(f"Error: Manifest not found at {manifest_path}")
         return 1
 
-    rows = load_manifest(manifest_path)
+    rows = read_csv(manifest_path)
     results = analyze_progress(rows, args.year)
 
     print_summary(results, args.year)

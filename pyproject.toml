@@ -1,0 +1,38 @@
+[project]
+name = "pai-scraper"
+version = "0.1.0"
+description = "Scraper and data tools for the Panchayat Advancement Index (PAI) Gram Panchayat scores"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "playwright>=1.45",
+    "tqdm>=4.66",
+]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14",
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "mypy>=1.13",
+]
+
+# Scripts-only application: uv manages the environment but does not build/install
+# this project as a package (the tools live under scripts/, run via `uv run`).
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.13"
+ignore_missing_imports = true
