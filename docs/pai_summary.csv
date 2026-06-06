@@ -1,0 +1,3 @@
+year,states_total,states_with_data,districts,blocks_with_data,blocks_no_data,blocks_failed,gp_count,score_rows,data_mb,html_mb
+2022-2023,34,29,753,5107,2092,0,125551,1255510,959.2,963.9
+2023-2024,34,33,741,4894,2241,0,114583,1145830,698.1,816.3
