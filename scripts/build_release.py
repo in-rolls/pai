@@ -9,9 +9,9 @@ For each year produces, under --out (default dist/):
                      dropdown_inventory_<year>.csv
       blocks/        per-block data_wide/metadata/scores_long.csv + DONE.json tree
       SUMMARY.md, README_data.txt
-  pai_<year>_html.zip      Dataverse asset (raw rendered HTML page captures)
+  pai_<year>_html.tar.gz   Dataverse asset (raw rendered HTML page captures)
 
-Stdlib only; global gp_scores_long.csv (~1.3 GB) is streamed.
+Stdlib only; consolidated CSVs are rebuilt from the per-block files.
 
 Usage:
   python scripts/build_release.py [--data-dir test_data] [--out dist] \
@@ -25,7 +25,6 @@ import csv
 import os
 import sys
 import tarfile
-import zipfile
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -60,15 +59,15 @@ DATAVERSE_MD = """# Uploading the HTML captures to Dataverse
 
 Two archives were built for Dataverse (raw rendered page HTML, one per year):
 
-  dist/pai_2022-2023_html.zip
-  dist/pai_2023-2024_html.zip
+  dist/pai_2022-2023_html.tar.gz
+  dist/pai_2023-2024_html.tar.gz
 
 Steps:
 1. Go to your Dataverse collection and **Add Data -> New Dataset** (or open the existing dataset).
 2. Fill metadata (title e.g. "PAI Gram Panchayat score pages (raw HTML)", author, description,
    subject). Note in the description that the parsed CSV data lives in the GitHub release.
-3. **Upload Files** -> add both `pai_<year>_html.zip` files. (Dataverse keeps .zip as-is when
-   "uncompress" is declined — keep them zipped.)
+3. **Upload Files** -> add both `pai_<year>_html.tar.gz` files. (Dataverse stores .tar.gz as a
+   single file, unlike .zip which it offers to auto-extract.)
 4. **Publish** the dataset.
 5. Copy the dataset **DOI** (e.g. doi:10.7910/DVN/XXXXXX) and paste it into the README "Data"
    section, replacing the `<DATAVERSE_DOI>` placeholder.
@@ -205,15 +204,15 @@ def build_data_archive(data_dir: Path, out: Path, year: str) -> Path:
 
 
 def build_html_archive(data_dir: Path, out: Path, year: str) -> Path:
+    """Raw HTML page captures for Dataverse, as a single .tar.gz (Dataverse leaves
+    .tar.gz as one opaque file rather than auto-extracting it like a .zip)."""
     year_dir = data_dir / year
-    archive = out / f"pai_{year}_html.zip"
+    archive = out / f"pai_{year}_html.tar.gz"
     print(f"  [{year}] writing {archive.name} (raw HTML page captures) ...")
     n = 0
-    with zipfile.ZipFile(
-        archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True
-    ) as zf:
+    with tarfile.open(archive, "w:gz") as tar:
         for fp in sorted(year_dir.rglob("*.html")):
-            zf.write(
+            tar.add(
                 fp, arcname=str(Path(f"pai_{year}_html") / fp.relative_to(year_dir))
             )
             n += 1

@@ -39,7 +39,7 @@ not the append-only logs.
 ### Download — raw HTML page captures (Dataverse)
 
 The rendered HTML for every block page (~11,400 pages) is archived on Dataverse:
-**DOI: `<DATAVERSE_DOI>`** (`pai_2022-2023_html.zip`, `pai_2023-2024_html.zip`).
+**DOI: `<DATAVERSE_DOI>`** (`pai_2022-2023_html.tar.gz`, `pai_2023-2024_html.tar.gz`).
 
 ### Notes
 
