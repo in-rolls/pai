@@ -11,17 +11,17 @@ thematic scores/grades (T1 Poverty-Free … T9 Women-Friendly) per Gram Panchaya
 
 | year | states with data | districts | GPs | score rows (long) | blocks (data / no-data) |
 | --- | --- | --- | --- | --- | --- |
-| 2022-2023 | 29 / 34 | 753 | 125,551 | 1,255,510 | 5,107 / 2,092 |
-| 2023-2024 | 33 / 34 | 741 | 114,583 | 1,145,830 | 4,894 / 2,241 |
+| 2022-2023 | 29 / 34 | 753 | 169,673 | 1,696,730 | 5,917 / 1,282 |
+| 2023-2024 | 33 / 34 | 741 | 183,011 | 1,830,110 | 6,103 / 1,032 |
 
 Full per-state breakdown: [`docs/pai_summary_by_state.csv`](docs/pai_summary_by_state.csv)
 (year totals: [`docs/pai_summary.csv`](docs/pai_summary.csv)). Regenerate with
 `uv run scripts/data_summary.py`.
 
-### Download — parsed data (GitHub Release [`data-v1`](https://github.com/in-rolls/pai/releases/tag/data-v1))
+### Download — parsed data (GitHub Release [`data-v2`](https://github.com/in-rolls/pai/releases/tag/data-v2))
 
-- [`pai_2022-2023_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v1/pai_2022-2023_data.tar.gz) (~72 MB)
-- [`pai_2023-2024_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v1/pai_2023-2024_data.tar.gz) (~56 MB)
+- [`pai_2022-2023_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v2/pai_2022-2023_data.tar.gz) (~96 MB)
+- [`pai_2023-2024_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v2/pai_2023-2024_data.tar.gz) (~87 MB)
 
 Each archive contains, under `consolidated/`:
 
@@ -38,7 +38,7 @@ not the append-only logs.
 
 ### Download — raw HTML page captures (Dataverse)
 
-The rendered HTML for every block page (~11,400 pages) is archived on Dataverse:
+The rendered HTML for every block page (~13,400 pages) is archived on Dataverse:
 **[doi:10.7910/DVN/FRUKWS](https://doi.org/10.7910/DVN/FRUKWS)**
 (`pai_2022-2023_html.tar.gz`, `pai_2023-2024_html.tar.gz`).
 

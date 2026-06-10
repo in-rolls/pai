@@ -130,16 +130,25 @@ def is_real_option(option: dict[str, str]) -> bool:
 
 
 def skip_decision(
-    prior_status: str, prior_rows: int, *, retry_no_data: bool, retry_empty: bool
+    prior_status: str,
+    prior_rows: int,
+    *,
+    retry_no_data: bool,
+    retry_empty: bool,
+    prior_reverified: bool = False,
 ) -> str | None:
     """Decide whether a previously-finished block should be skipped on a resumable run.
 
-    Returns "no_data" (skip a confirmed no-data block), "done" (skip a finished block),
-    or None (re-scrape it). `--retry-no-data` re-verifies no-data blocks; `--retry-empty`
-    re-does zero-row blocks.
+    Returns "no_data" / "done" to skip, or None to re-scrape it. `--retry-no-data`
+    re-verifies no-data blocks, but only those NOT already re-verified this recovery
+    (`prior_reverified` = the DONE.json carries a `confirmations` stamp) — so repeated
+    passes chase only the un-verified gaps and never re-do genuinely-empty blocks again.
+    `--retry-empty` re-does zero-row blocks.
     """
     if prior_status == "done_no_data_available":
-        return None if retry_no_data else "no_data"
+        if retry_no_data and not prior_reverified:
+            return None
+        return "no_data"
     if prior_rows > 0 or not retry_empty:
         return "done"
     return None
@@ -841,6 +850,7 @@ async def scrape_block(
             prior_rows,
             retry_no_data=args.retry_no_data,
             retry_empty=args.retry_empty,
+            prior_reverified="confirmations" in prior,
         )
         if decision == "no_data":
             logger.info("Skipping block (no data available): %s", block_dir)
@@ -1637,9 +1647,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-data-confirm",
         type=int,
-        default=2,
+        default=1,
         help="Times a 'not available' must reproduce on re-search before it is accepted as "
-        "genuine no-data (0 = trust the first response; default 2).",
+        "genuine no-data (0 = trust the first response; default 1). Across-pass re-verification "
+        "(--retry-no-data) adds further, time-independent confirmation.",
     )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--stop-on-error", action="store_true")
