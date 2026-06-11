@@ -11,17 +11,17 @@ thematic scores/grades (T1 Poverty-Free … T9 Women-Friendly) per Gram Panchaya
 
 | year | states with data | districts | GPs | score rows (long) | blocks (data / no-data) |
 | --- | --- | --- | --- | --- | --- |
-| 2022-2023 | 29 / 34 | 753 | 125,551 | 1,255,510 | 5,107 / 2,092 |
-| 2023-2024 | 33 / 34 | 741 | 114,583 | 1,145,830 | 4,894 / 2,241 |
+| 2022-2023 | 29 / 34 | 753 | 169,673 | 1,696,730 | 5,917 / 1,282 |
+| 2023-2024 | 33 / 34 | 741 | 183,011 | 1,830,110 | 6,103 / 1,032 |
 
 Full per-state breakdown: [`docs/pai_summary_by_state.csv`](docs/pai_summary_by_state.csv)
 (year totals: [`docs/pai_summary.csv`](docs/pai_summary.csv)). Regenerate with
-`python scripts/data_summary.py`.
+`uv run scripts/data_summary.py`.
 
-### Download — parsed data (GitHub Release [`data-v1`](https://github.com/in-rolls/pai/releases/tag/data-v1))
+### Download — parsed data (GitHub Release [`data-v2`](https://github.com/in-rolls/pai/releases/tag/data-v2))
 
-- [`pai_2022-2023_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v1/pai_2022-2023_data.tar.gz) (~72 MB)
-- [`pai_2023-2024_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v1/pai_2023-2024_data.tar.gz) (~56 MB)
+- [`pai_2022-2023_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v2/pai_2022-2023_data.tar.gz) (~96 MB)
+- [`pai_2023-2024_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v2/pai_2023-2024_data.tar.gz) (~87 MB)
 
 Each archive contains, under `consolidated/`:
 
@@ -38,7 +38,7 @@ not the append-only logs.
 
 ### Download — raw HTML page captures (Dataverse)
 
-The rendered HTML for every block page (~11,400 pages) is archived on Dataverse:
+The rendered HTML for every block page (~13,400 pages) is archived on Dataverse:
 **[doi:10.7910/DVN/FRUKWS](https://doi.org/10.7910/DVN/FRUKWS)**
 (`pai_2022-2023_html.tar.gz`, `pai_2023-2024_html.tar.gz`).
 
@@ -73,13 +73,20 @@ uv run scripts/pai_scraper_resumable.py --years 2022-2023 2023-2024 --headless -
 
 ## Resume
 
-Run the same command again — blocks with `DONE.json` are skipped. Use `--retry-empty` to
-retry blocks that completed with zero GP rows, or `--overwrite` to rescrape matching blocks.
+Run the same command again — blocks with `DONE.json` are skipped. Retry flags:
+
+- `--retry-empty` — re-do blocks that finished with zero GP rows.
+- `--retry-no-data` — re-verify blocks previously marked "no data available". The server returns an
+  identical "not available" alert both for genuinely empty blocks and (spuriously) under load, so a
+  no-data result is confirmed by re-searching `--no-data-confirm` times (default 2) before it is
+  accepted; if data appears it is recovered, and an indeterminate recheck is retried (never a
+  terminal false negative).
+- `--overwrite` — rescrape matching blocks unconditionally.
 
 ## Outputs
 
 ```text
-test_data/
+data/
 ├── pai_scrape.log
 ├── block_manifest.csv          # append-only scrape log
 ├── dropdown_inventory.csv      # append-only option universe
@@ -100,10 +107,10 @@ The **per-block files are the source of truth.** The consolidated `gp_metadata.c
 inline), so they can never drift or duplicate:
 
 ```bash
-uv run scripts/pai_rebuild_index.py --out test_data   # de-duplicated global indexes
+uv run scripts/pai_rebuild_index.py --out data   # de-duplicated global indexes
 uv run scripts/data_summary.py                        # coverage tables -> docs/pai_summary*.csv
 uv run scripts/scrape_progress.py --year 2023-2024    # progress from block_manifest.csv
-uv run scripts/pai_inspect_output.py --out test_data  # quick counts
+uv run scripts/pai_inspect_output.py --out data  # quick counts
 uv run scripts/build_release.py                       # release archives -> dist/
 ```
 

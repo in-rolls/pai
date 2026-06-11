@@ -7,7 +7,7 @@ construction — unlike the scraper, it never appends, it overwrites. This is th
 canonical way to (re)generate ``gp_metadata.csv`` and ``gp_scores_long.csv``.
 
 Usage:
-  uv run scripts/pai_rebuild_index.py --out test_data
+  uv run scripts/pai_rebuild_index.py --out data
 """
 
 import argparse
@@ -21,7 +21,7 @@ from pai_common import METADATA_CSV, SCORES_LONG_CSV, consolidate_per_block  # n
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Rebuild global indexes from per-block files")
-    parser.add_argument("--out", default="test_data")
+    parser.add_argument("--out", default="data")
     args = parser.parse_args()
 
     out = Path(args.out)

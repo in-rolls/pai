@@ -146,8 +146,8 @@ def main():
     args = parser.parse_args()
 
     base_dir = Path(__file__).parent.parent
-    manifest_path = base_dir / "test_data" / "block_manifest.csv"
-    data_dir = base_dir / "test_data"
+    manifest_path = base_dir / "data" / "block_manifest.csv"
+    data_dir = base_dir / "data"
 
     if not manifest_path.exists():
         print(f"Error: Manifest not found at {manifest_path}")

@@ -14,7 +14,7 @@ For each year produces, under --out (default dist/):
 Stdlib only; consolidated CSVs are rebuilt from the per-block files.
 
 Usage:
-  python scripts/build_release.py [--data-dir test_data] [--out dist] \
+  python scripts/build_release.py [--data-dir data] [--out dist] \
       [--years 2022-2023 2023-2024] [--skip-html] [--skip-data]
 """
 
@@ -178,7 +178,7 @@ def build_html_archive(data_dir: Path, out: Path, year: str) -> Path:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build per-year PAI release archives")
-    ap.add_argument("--data-dir", default="test_data")
+    ap.add_argument("--data-dir", default="data")
     ap.add_argument("--out", default="dist")
     ap.add_argument("--years", nargs="+", default=["2022-2023", "2023-2024"])
     ap.add_argument("--skip-html", action="store_true", help="Skip the (large) Dataverse HTML zips")
