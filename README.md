@@ -18,12 +18,26 @@ Full per-state breakdown: [`docs/pai_summary_by_state.csv`](docs/pai_summary_by_
 (year totals: [`docs/pai_summary.csv`](docs/pai_summary.csv)). Regenerate with
 `uv run scripts/data_summary.py`.
 
-### Download — parsed data (GitHub Release [`data-v2`](https://github.com/in-rolls/pai/releases/tag/data-v2))
+### Download — [doi:10.7910/DVN/FRUKWS](https://doi.org/10.7910/DVN/FRUKWS)
 
-- [`pai_2022-2023_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v2/pai_2022-2023_data.tar.gz) (~96 MB)
-- [`pai_2023-2024_data.tar.gz`](https://github.com/in-rolls/pai/releases/download/data-v2/pai_2023-2024_data.tar.gz) (~87 MB)
+Everything is published on Harvard Dataverse — parsed data and raw page captures alike.
+No account or API token needed:
 
-Each archive contains, under `consolidated/`:
+| archive | contents | size | md5 |
+| --- | --- | --- | --- |
+| `pai_2022-2023_data.tar.gz` | parsed CSVs | 95.5 MiB | `92605f222e4dcdf4cfbdb1d0bd318cd5` |
+| `pai_2023-2024_data.tar.gz` | parsed CSVs | 86.6 MiB | `ba3839ce006355c43253e89c57d07ee3` |
+| `pai_2022-2023_html.tar.gz` | raw page captures (~13,400 pages) | 318.0 MiB | `9b9ebd5e9c1cf8d489eb76702622eec7` |
+| `pai_2023-2024_html.tar.gz` | raw page captures | 300.6 MiB | `635073437396c306e81cf34d48c832b5` |
+
+```bash
+curl -L -o pai_2022-2023_data.tar.gz https://dataverse.harvard.edu/api/access/datafile/13999603
+curl -L -o pai_2023-2024_data.tar.gz https://dataverse.harvard.edu/api/access/datafile/13999607
+curl -L -o pai_2022-2023_html.tar.gz https://dataverse.harvard.edu/api/access/datafile/13999606
+curl -L -o pai_2023-2024_html.tar.gz https://dataverse.harvard.edu/api/access/datafile/13999608
+```
+
+Each `_data` archive contains, under `consolidated/`:
 
 | file | grain | description |
 | --- | --- | --- |
@@ -36,11 +50,7 @@ Archives also include the raw per-block CSV/JSON tree under `blocks/` and a `SUM
 The consolidated CSVs are rebuilt from the per-block files (de-duplicated current state),
 not the append-only logs.
 
-### Download — raw HTML page captures (Dataverse)
-
-The rendered HTML for every block page (~13,400 pages) is archived on Dataverse:
-**[doi:10.7910/DVN/FRUKWS](https://doi.org/10.7910/DVN/FRUKWS)**
-(`pai_2022-2023_html.tar.gz`, `pai_2023-2024_html.tar.gz`).
+The `_html` archives hold the rendered HTML for every block page, as scraped.
 
 ### Notes
 

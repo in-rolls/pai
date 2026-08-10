@@ -2,14 +2,15 @@
 """
 Build per-year release archives for the PAI data.
 
-For each year produces, under --out (default dist/):
-  pai_<year>_data.tar.gz   GitHub Release asset (CSV/JSON only, NO html/debug):
+For each year produces, under --out (default dist/). All four archives are published to
+Dataverse (doi:10.7910/DVN/FRUKWS); see DATAVERSE_UPLOAD.md written alongside them.
+  pai_<year>_data.tar.gz   CSV/JSON only, NO html/debug:
       consolidated/  gp_metadata_<year>.csv, gp_scores_long_<year>.csv,
                      gp_scores_wide_<year>.csv, block_manifest_<year>.csv,
                      dropdown_inventory_<year>.csv
       blocks/        per-block data_wide/metadata/scores_long.csv + DONE.json tree
       SUMMARY.md, README_data.txt
-  pai_<year>_html.tar.gz   Dataverse asset (raw rendered HTML page captures)
+  pai_<year>_html.tar.gz   raw rendered HTML page captures
 
 Stdlib only; consolidated CSVs are rebuilt from the per-block files.
 
@@ -53,26 +54,34 @@ Files (consolidated/):
 
 blocks/  raw per-block CSV/JSON exactly as scraped (data_wide/metadata/scores_long + DONE.json).
 
-Raw rendered HTML page captures are published separately on Dataverse (see the repository README).
+The matching raw HTML page captures are published alongside this archive on Dataverse
+(doi:10.7910/DVN/FRUKWS).
 Source: https://pai.gov.in  |  Scraper: scripts/pai_scraper_resumable.py
 """
 
-DATAVERSE_MD = """# Uploading the HTML captures to Dataverse
+DATAVERSE_MD = """# Uploading the release archives to Dataverse
 
-Two archives were built for Dataverse (raw rendered page HTML, one per year):
+Dataverse is the sole home for this dataset — parsed data and raw page captures alike.
+All four archives go up, not just the HTML:
 
+  dist/pai_2022-2023_data.tar.gz
+  dist/pai_2023-2024_data.tar.gz
   dist/pai_2022-2023_html.tar.gz
   dist/pai_2023-2024_html.tar.gz
 
 Steps:
 1. Go to your Dataverse collection and **Add Data -> New Dataset** (or open the existing dataset).
-2. Fill metadata (title e.g. "PAI Gram Panchayat score pages (raw HTML)", author, description,
-   subject). Note in the description that the parsed CSV data lives in the GitHub release.
-3. **Upload Files** -> add both `pai_<year>_html.tar.gz` files. (Dataverse stores .tar.gz as a
-   single file, unlike .zip which it offers to auto-extract.)
+2. Fill metadata (title e.g. "PAI Gram Panchayat scores and score pages", author, description,
+   subject). Describe both parts: the parsed CSVs and the raw HTML they were parsed from.
+3. **Upload Files** -> add all four archives. (Dataverse stores .tar.gz as a single file, unlike
+   .zip which it offers to auto-extract.)
 4. **Publish** the dataset.
-5. Copy the dataset **DOI** (e.g. doi:10.7910/DVN/XXXXXX) and paste it into the README "Data"
-   section, replacing the `<DATAVERSE_DOI>` placeholder.
+5. Copy the dataset **DOI** (e.g. doi:10.7910/DVN/XXXXXX) into the README "Download" section,
+   along with each file's numeric id from
+   `/api/datasets/:persistentId/?persistentId=doi:...` so the curl commands resolve.
+
+Do not attach the archives to a GitHub release as well. A second copy can drift from this one,
+and the README then has to point at whichever is authoritative.
 """
 
 
@@ -181,8 +190,8 @@ def main() -> int:
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--out", default="dist")
     ap.add_argument("--years", nargs="+", default=["2022-2023", "2023-2024"])
-    ap.add_argument("--skip-html", action="store_true", help="Skip the (large) Dataverse HTML zips")
-    ap.add_argument("--skip-data", action="store_true", help="Skip the GitHub data tar.gz")
+    ap.add_argument("--skip-html", action="store_true", help="Skip the (large) HTML capture archives")
+    ap.add_argument("--skip-data", action="store_true", help="Skip the parsed data archives")
     args = ap.parse_args()
 
     data_dir = Path(args.data_dir)
