@@ -8,16 +8,19 @@ that the scraper, index rebuilder, summariser, and packager all need.
 import csv
 import json
 import os
-from collections.abc import Iterator
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pai_stores import BlockStore  # noqa: E402
 
 # --------------------------------------------------------------------------- #
 # Per-year page configuration
 # --------------------------------------------------------------------------- #
-# The two PAI editions use different result pages. 2022-2023 (PAI 1.0) renders a
-# GP-anchor-first table (#GVdataT, "legacy"); 2023-2024 (PAI 2.0) renders a flat
-# State/District/Block/GP/Overall + per-theme table (#GVdata, "flat").
+# The current unified page renders both editions in the GP-anchor-first legacy
+# table. PAI 2.0 originally had a separate flat page, TW-GP-New.aspx?s=2, but
+# that route is now incomplete and omits the GP LGD code. Do not restore it.
 YEAR_CONFIGS: dict[str, dict[str, str]] = {
     "2022-2023": {
         "url": "https://pai.gov.in/PS/Public/TW-GP.aspx?s=1",
@@ -26,13 +29,56 @@ YEAR_CONFIGS: dict[str, dict[str, str]] = {
         "layout": "legacy",
     },
     "2023-2024": {
-        "url": "https://pai.gov.in/PS/Public/TW-GP-New.aspx?s=2",
+        "url": "https://pai.gov.in/PS/Public/TW-GP.aspx",
         "expected_fy_value": "2",
-        "result_table": "#GVdata",
-        "layout": "flat",
+        "result_table": "#GVdataT",
+        "layout": "legacy",
     },
 }
 YEARS: list[str] = list(YEAR_CONFIGS)
+
+EXPECTED_SCORE_ROWS_PER_GP = 10
+OFFICIAL_FINAL_GP_COUNTS: dict[str, dict[str, int]] = {
+    "2023-2024": {
+        "Andaman And Nicobar Islands": 70,
+        "Andhra Pradesh": 13_310,
+        "Arunachal Pradesh": 2_108,
+        "Assam": 2_192,
+        "Bihar": 8_053,
+        "Chhattisgarh": 11_643,
+        "Goa": 188,
+        "Gujarat": 14_534,
+        "Haryana": 6_225,
+        "Himachal Pradesh": 3_615,
+        "Jammu And Kashmir": 4_291,
+        "Jharkhand": 4_345,
+        "Karnataka": 5_946,
+        "Kerala": 941,
+        "Ladakh": 193,
+        "Lakshadweep": 10,
+        "Madhya Pradesh": 23_011,
+        "Maharashtra": 27_894,
+        "Manipur": 3_041,
+        "Meghalaya": 3_069,
+        "Mizoram": 840,
+        "Nagaland": 1_277,
+        "Odisha": 6_794,
+        "Puducherry": 108,
+        "Punjab": 13_233,
+        "Uttar Pradesh": 57_678,
+        "Rajasthan": 11_037,
+        "Sikkim": 199,
+        "Tamil Nadu": 12_482,
+        "Telangana": 12_556,
+        "The Dadra And Nagar Haveli And Daman And Diu": 42,
+        "Tripura": 1_176,
+        "Uttarakhand": 7_766,
+        "__india__": 259_867,
+    }
+}
+OFFICIAL_FINAL_GP_COUNTS_SOURCE = (
+    "https://www.pib.gov.in/PressReleasePage.aspx?PRID=2294288&lang=1&reg=6"
+)
 
 # Results paginate 100 GPs per "Next 100 >>" click. The flat page never marks
 # #btnNext disabled, so a short page (< 100 rows) signals the last page.
@@ -42,6 +88,23 @@ FLAT_PAGE_SIZE = 100
 # wide CSV exposes as the "<slug>_score" column below.
 OVERALL_SLUG = "overall_pai_score"
 OVERALL_COL = f"{OVERALL_SLUG}_score"
+CANONICAL_THEME_SLUGS = (
+    OVERALL_SLUG,
+    "t1_poverty_free_and_enhanced_livelihoods_panchayat",
+    "t2_healthy_panchayat",
+    "t3_child_friendly_panchayat",
+    "t4_water_sufficient_panchayat",
+    "t5_clean_and_green_panchayat",
+    "t6_self_sufficient_infrastructure_in_panchayat",
+    "t7_socially_just_and_socially_secured_panchayat",
+    "t8_panchayat_with_good_governance",
+    "t9_women_friendly_panchayat",
+)
+WIDE_THEME_FIELDS = tuple(
+    f"{slug}_{suffix}"
+    for slug in CANONICAL_THEME_SLUGS
+    for suffix in ("score", "grade", "band", "raw")
+)
 
 # Browser timeouts (milliseconds) — named so they are not scattered magic numbers.
 NAV_TIMEOUT_MS = 120_000
@@ -138,6 +201,21 @@ GP_SCORE_FIELDS = GP_METADATA_FIELDS + [
     "raw_value",
 ]
 
+GP_UNIVERSE_FIELDS = [
+    "year",
+    "state",
+    "state_value",
+    "district",
+    "district_value",
+    "block",
+    "block_value",
+    "gp_code",
+    "gp_name",
+    "source_url",
+    "retrieved_utc",
+    "source_sha256",
+]
+
 # Per-block file names.
 DONE_JSON = "DONE.json"
 FAILED_JSON = "FAILED.json"
@@ -204,13 +282,6 @@ def write_json(path: Path, obj: dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 # Per-block tree helpers
 # --------------------------------------------------------------------------- #
-def iter_block_dirs(year_dir: Path) -> Iterator[Path]:
-    """Yield each per-block directory under year_dir (one with DONE.json/FAILED.json)."""
-    for root, _dirs, files in os.walk(year_dir):
-        if DONE_JSON in files or FAILED_JSON in files:
-            yield Path(root)
-
-
 def read_block_status(block_dir: Path) -> dict[str, Any] | None:
     """Return the block's DONE.json (preferred) or FAILED.json as a dict, or None."""
     for name in (DONE_JSON, FAILED_JSON):
@@ -223,39 +294,56 @@ def read_block_status(block_dir: Path) -> dict[str, Any] | None:
     return None
 
 
-def consolidate_per_block(year_dir: Path, fname: str, dst: Path) -> int:
-    """Union-concat every per-block ``fname`` (e.g. data_wide.csv) under year_dir.
+def consolidate_per_block(
+    data_dir: Path, fname: str, dst: Path, years: list[str] | None = None
+) -> int:
+    """Union-concat every per-block ``fname`` (e.g. data_wide.csv) into one CSV.
 
     The per-block files are the authoritative current state (one file per block,
     overwritten on each scrape), so this de-duplicates by construction. Returns
     the number of data rows written.
+
+    Reads through :class:`BlockStore`, so it works whether the tree is live on
+    disk or compacted into a zstd archive. Two passes: the header is the union of
+    every block's columns in first-seen order, which is not known until all are
+    read.
     """
-    files = sorted(year_dir.rglob(fname))
+    store = BlockStore(data_dir)
+    years = years if years is not None else store.years()
+
     fields: list[str] = []
     seen: set[str] = set()
-    for fp in files:
-        try:
-            with fp.open(newline="", encoding="utf-8") as f:
-                header = next(csv.reader(f), [])
-        except OSError:
-            continue
-        for c in header:
-            if c not in seen:
-                seen.add(c)
-                fields.append(c)
+    for year in years:
+        for blk in store.iter_blocks(year, names={fname}):
+            for col in blk.header(fname):
+                if col not in seen:
+                    seen.add(col)
+                    fields.append(col)
+
     if not fields:
+        dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_text("", encoding="utf-8")
         return 0
+
     n = 0
+    dst.parent.mkdir(parents=True, exist_ok=True)
     with dst.open("w", newline="", encoding="utf-8") as fo:
         writer = csv.DictWriter(fo, fieldnames=fields, extrasaction="ignore", restval="")
         writer.writeheader()
-        for fp in files:
-            try:
-                with fp.open(newline="", encoding="utf-8") as f:
-                    for row in csv.DictReader(f):
-                        writer.writerow(row)
-                        n += 1
-            except OSError:
-                continue
+        for year in years:
+            for blk in store.iter_blocks(year, names={fname}):
+                for row in blk.rows(fname):
+                    # Operational paths are stored relative to the collection
+                    # root so a resumable run can be moved without leaving
+                    # stale absolute/staging paths in the analysis release.
+                    block_rel = blk.rel.as_posix()
+                    if "block_dir" in row:
+                        row["block_dir"] = block_rel
+                    if "block_data_wide_csv" in row:
+                        row["block_data_wide_csv"] = f"{block_rel}/{DATA_WIDE_CSV}"
+                    if "block_html_file" in row and row.get("block_page"):
+                        page = int(row["block_page"])
+                        row["block_html_file"] = f"{block_rel}/html/page_{page:03d}.html"
+                    writer.writerow(row)
+                    n += 1
     return n

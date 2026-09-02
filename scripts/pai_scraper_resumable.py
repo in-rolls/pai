@@ -25,11 +25,14 @@ Full run:
 
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
 import sys
 import traceback
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -47,10 +50,17 @@ from pai_common import (  # noqa: E402
     GP_SCORE_FIELDS,
     YEAR_CONFIGS,
     append_csv_rows,
+    read_csv,
     read_json,
     write_csv_rows,
     write_json,
 )
+from pai_contracts import (  # noqa: E402
+    canonicalize_parsed_themes,
+    load_score_value_exceptions,
+    validate_block_rows,
+)
+from pai_stores import BlockStore  # noqa: E402
 
 # Default selector for the legacy (2022-2023) page. The 2023-2024 path passes
 # its own selector/layout explicitly via YEAR_CONFIGS.
@@ -92,9 +102,42 @@ BAD_OPTION_TEXT = (
     "चुनें",
 )
 
+BLOCK_COUNT_AUDIT_FIELDS = [
+    "run_id",
+    "timestamp_utc",
+    "year",
+    "state",
+    "state_value",
+    "district",
+    "district_value",
+    "block",
+    "block_value",
+    "retrieval",
+    "baseline_gp_rows",
+    "universe_gp_rows",
+    "live_gp_rows",
+    "delta_from_baseline",
+    "missing_universe_codes",
+    "unexpected_score_codes",
+    "status",
+    "exception_evidence",
+]
+
+GP_UNIVERSE_URL = "https://pai.gov.in/Handlers/Y_GPs_By_LGD_Block.ashx"
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
+
+
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_bytes(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def clean_label(text: str) -> str:
@@ -152,6 +195,264 @@ def skip_decision(
     if prior_rows > 0 or not retry_empty:
         return "done"
     return None
+
+
+def block_key(
+    year: str, state_value: str, district_value: str, block_value: str
+) -> tuple[str, str, str, str]:
+    return year, state_value, district_value, block_value
+
+
+def load_baseline_gp_counts(data_dir: Path, years: list[str]) -> dict[tuple[str, ...], int]:
+    """Load prior block counts for diagnostics, never as a completeness gate."""
+    store = BlockStore(data_dir)
+    counts: dict[tuple[str, ...], int] = {}
+    for year in years:
+        for block in store.iter_blocks(year, names={"DONE.json"}):
+            status = block.json("DONE.json")
+            if not status or status.get("status") != "done":
+                continue
+            key = block_key(
+                year,
+                str(status.get("state_value", "")),
+                str(status.get("district_value", "")),
+                str(status.get("block_value", "")),
+            )
+            if all(key[1:]):
+                counts[key] = int(status.get("gp_rows", 0) or 0)
+    return counts
+
+
+def load_universe_exceptions(path: Path | None) -> dict[tuple[str, ...], dict[str, Any]]:
+    """Load reviewed score/universe differences; every exception must carry evidence."""
+    if path is None:
+        return {}
+    exceptions: dict[tuple[str, ...], dict[str, Any]] = {}
+    for row in read_csv(path):
+        evidence = row.get("evidence", "").strip()
+        if not evidence:
+            raise ValueError(f"{path}: every block-count exception requires evidence")
+        key = block_key(
+            row.get("year", ""),
+            row.get("state_value", ""),
+            row.get("district_value", ""),
+            row.get("block_value", ""),
+        )
+        exceptions[key] = {
+            "allowed_missing_gp_codes": {
+                code.strip()
+                for code in row.get("allowed_missing_gp_codes", "").split(";")
+                if code.strip()
+            },
+            "evidence": evidence,
+        }
+    return exceptions
+
+
+def load_gp_name_links(path: Path | None) -> dict[tuple[str, ...], dict[str, dict[str, str]]]:
+    """Load reviewed block-local score-name to universe-code links."""
+    if path is None:
+        return {}
+    links: dict[tuple[str, ...], dict[str, dict[str, str]]] = {}
+    for row in read_csv(path):
+        evidence = row.get("evidence", "").strip()
+        if not evidence:
+            raise ValueError(f"{path}: every reviewed GP-name link requires evidence")
+        key = block_key(
+            row.get("year", ""),
+            row.get("state_value", ""),
+            row.get("district_value", ""),
+            row.get("block_value", ""),
+        )
+        name_key = normalize_gp_name(row.get("score_gp_name", ""))
+        gp_code = row.get("gp_code", "").strip()
+        if not name_key or not gp_code:
+            raise ValueError(f"{path}: score_gp_name and gp_code are required")
+        links.setdefault(key, {})[name_key] = {"gp_code": gp_code, "evidence": evidence}
+    return links
+
+
+def normalize_gp_name(value: str) -> str:
+    """Conservative Unicode/whitespace normalization for block-local exact links."""
+    return " ".join(unicodedata.normalize("NFKC", value or "").split()).casefold()
+
+
+def clean_universe_gp_name(gp_code: str, raw_name: str) -> str:
+    """Remove the handler's trailing ``[LGD code]`` after checking it."""
+    match = re.match(r"^(.*?)\s*\[(\d+)\]\s*$", raw_name or "")
+    if not match:
+        return clean_label(raw_name)
+    if match.group(2) != gp_code:
+        raise AssertionError(
+            f"GP-universe code disagrees with name suffix: {gp_code} != {match.group(2)}"
+        )
+    return clean_label(match.group(1))
+
+
+def link_missing_gp_codes(
+    metadata: list[dict[str, Any]],
+    scores: list[dict[str, Any]],
+    wide: list[dict[str, Any]],
+    universe: dict[str, str],
+    reviewed_links: dict[str, dict[str, str]] | None = None,
+) -> None:
+    """Fill absent score LGD codes by block-local name, never by row order."""
+    reviewed_links = reviewed_links or {}
+    codes_by_name: dict[str, list[str]] = {}
+    for code, name in universe.items():
+        codes_by_name.setdefault(normalize_gp_name(name), []).append(code)
+
+    links: dict[str, str] = {}
+    for row in metadata:
+        name = normalize_gp_name(str(row.get("gp_name", "")))
+        existing = str(row.get("gp_code", "")).strip()
+        if existing in universe and normalize_gp_name(universe[existing]) == name:
+            code = existing
+        else:
+            reviewed = reviewed_links.get(name)
+            if reviewed:
+                code = reviewed["gp_code"]
+                if code not in universe:
+                    raise AssertionError(f"reviewed GP code {code} is absent from block universe")
+            else:
+                candidates = codes_by_name.get(name, [])
+                if len(candidates) != 1:
+                    raise AssertionError(
+                        f"GP name {row.get('gp_name')!r} has {len(candidates)} exact universe "
+                        "matches; add a reviewed name link"
+                    )
+                code = candidates[0]
+        links[name] = code
+
+    for rows in (metadata, scores, wide):
+        for row in rows:
+            row["gp_code"] = links[normalize_gp_name(str(row.get("gp_name", "")))]
+
+
+def validate_gp_universe(
+    score_codes: set[str],
+    universe_codes: set[str],
+    exception: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Require score results to match the portal's block GP universe exactly."""
+    missing = universe_codes - score_codes
+    unexpected = score_codes - universe_codes
+    allowed_missing = exception["allowed_missing_gp_codes"] if exception else set()
+
+    if unexpected:
+        raise AssertionError(
+            "score result has GP codes absent from the official block universe: "
+            + ";".join(sorted(unexpected))
+        )
+    if missing != allowed_missing:
+        raise AssertionError(
+            "score result does not match the official block universe: "
+            f"missing={';'.join(sorted(missing)) or '(none)'}; "
+            f"reviewed_allowed={';'.join(sorted(allowed_missing)) or '(none)'}"
+        )
+    return {
+        "status": "reviewed_exception" if missing else "exact_universe_match",
+        "missing": missing,
+        "unexpected": unexpected,
+    }
+
+
+def cached_universe_is_valid(block_dir: Path, done: dict[str, Any]) -> bool:
+    """Only resume-skip a block whose cached handler source still validates."""
+    raw_path = block_dir / "source" / "gp_universe.json"
+    provenance_path = block_dir / "source" / "gp_universe_provenance.json"
+    try:
+        raw = raw_path.read_bytes()
+        provenance = read_json(provenance_path)
+        payload = json.loads(raw)
+        rows = payload["rows"]
+        return bool(
+            payload.get("columns") == ["gp_code", "nm"]
+            and isinstance(rows, list)
+            and provenance.get("http_status") == 200
+            and provenance.get("sha256") == hashlib.sha256(raw).hexdigest()
+            and int(provenance.get("gp_rows", -1)) == len(rows)
+            and int(done.get("universe_gp_rows", -1)) == len(rows)
+        )
+    except KeyError, OSError, TypeError, ValueError, json.JSONDecodeError:
+        return False
+
+
+async def fetch_gp_universe(
+    page,
+    *,
+    year: str,
+    state: dict[str, str],
+    district: dict[str, str],
+    block: dict[str, str],
+    block_dir: Path,
+) -> dict[str, str]:
+    """Fetch and preserve the portal's official LGD GP universe for a block."""
+    params = {
+        "SID": state["value"],
+        "ZID": district["value"],
+        "BID": block["value"],
+        "YID": YEAR_CONFIGS[year]["expected_fy_value"],
+    }
+    response = await page.request.get(GP_UNIVERSE_URL, params=params, timeout=120_000)
+    if not response.ok:
+        raise RuntimeError(f"GP-universe handler returned HTTP {response.status}")
+    raw = await response.body()
+    payload = json.loads(raw)
+    if payload.get("columns") != ["gp_code", "nm"] or not isinstance(payload.get("rows"), list):
+        raise RuntimeError(f"Unexpected GP-universe response schema: {payload!r}")
+    if any(not isinstance(row, list) or len(row) != 2 for row in payload["rows"]):
+        raise RuntimeError("GP-universe handler returned malformed rows")
+    universe = {
+        str(row[0]): clean_universe_gp_name(str(row[0]), str(row[1])) for row in payload["rows"]
+    }
+    codes = list(universe)
+    if len(codes) != len(payload["rows"]):
+        raise RuntimeError("GP-universe handler returned duplicate LGD codes")
+
+    source_dir = block_dir / "source"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_bytes(source_dir / "gp_universe.json", raw)
+    provenance = {
+        "retrieved_utc": utc_now(),
+        "year": year,
+        "state": clean_label(state["text"]),
+        "state_value": state["value"],
+        "district": clean_label(district["text"]),
+        "district_value": district["value"],
+        "block": clean_label(block["text"]),
+        "block_value": block["value"],
+        "url": GP_UNIVERSE_URL,
+        "params": params,
+        "http_status": response.status,
+        "gp_rows": len(codes),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    atomic_write_bytes(
+        source_dir / "gp_universe_provenance.json",
+        (json.dumps(provenance, ensure_ascii=False, indent=2) + "\n").encode(),
+    )
+    return universe
+
+
+def result_signature(
+    metadata: list[dict[str, Any]], scores: list[dict[str, Any]]
+) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    gp_codes = tuple(sorted(str(row.get("gp_code", "")) for row in metadata))
+    score_cells = tuple(
+        sorted(
+            (
+                str(row.get("gp_code", "")),
+                str(row.get("theme_order", "")),
+                str(row.get("theme_slug", "")),
+                str(row.get("score", "")),
+                str(row.get("grade", "")),
+                str(row.get("band", "")),
+            )
+            for row in scores
+        )
+    )
+    return gp_codes, score_cells
 
 
 def setup_logger(out_dir: Path) -> logging.Logger:
@@ -499,8 +800,10 @@ async def parse_current_table(
         {"gp": {...}, "scores": [...], "wide": {...}}
     """
     if layout == "flat":
-        return await parse_table_flat(page, result_selector)
-    return await parse_table_legacy(page, result_selector)
+        parsed = await parse_table_flat(page, result_selector)
+    else:
+        parsed = await parse_table_legacy(page, result_selector)
+    return canonicalize_parsed_themes(parsed)
 
 
 async def parse_table_legacy(page, result_selector: str = RESULT_TABLE_SELECTOR) -> dict[str, Any]:
@@ -817,6 +1120,93 @@ def enrich_metadata_row(
     }
 
 
+async def collect_result_pages(
+    page,
+    *,
+    year: str,
+    state: dict[str, str],
+    district: dict[str, str],
+    block: dict[str, str],
+    base_meta: dict[str, Any],
+    block_dir: Path,
+    data_wide_csv: Path,
+    html_dir: Path,
+    html_prefix: str,
+    result_selector: str,
+    layout: str,
+    max_pages_per_block: int,
+    logger: logging.Logger,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], int]:
+    """Collect every result page for one retrieval of a selected block."""
+    all_wide_rows: list[dict[str, Any]] = []
+    all_meta_rows: list[dict[str, Any]] = []
+    all_score_rows: list[dict[str, Any]] = []
+    page_no = 1
+    prev_sig: tuple | None = None
+
+    while True:
+        html_path = html_dir / f"{html_prefix}page_{page_no:03d}.html"
+        await save_html(page, html_path)
+        parsed = await parse_current_table(page, result_selector, layout)
+        rows = parsed.get("rows", [])
+        logger.info(
+            "[%s] %s / %s / %s %spage %s: parsed %s GP rows",
+            year,
+            clean_label(state["text"]),
+            clean_label(district["text"]),
+            clean_label(block["text"]),
+            "confirmation " if html_prefix else "",
+            page_no,
+            len(rows),
+        )
+
+        cur_sig = tuple(item["gp"].get("gp_code") or item["gp"].get("gp_name", "") for item in rows)
+        if page_no > 1 and cur_sig == prev_sig:
+            break
+        prev_sig = cur_sig
+
+        for item in rows:
+            gp = item["gp"]
+            meta = enrich_metadata_row(
+                base=base_meta,
+                gp=gp,
+                block_page=page_no,
+                block_dir=block_dir,
+                data_wide_csv=data_wide_csv,
+                html_file=html_path,
+                source_url=page.url,
+            )
+            all_meta_rows.append(meta)
+            all_wide_rows.append({**meta, **item.get("wide", {})})
+            for score in item.get("scores", []):
+                all_score_rows.append(
+                    {
+                        **meta,
+                        "theme_order": score.get("theme_order", ""),
+                        "theme_header": score.get("theme_header", ""),
+                        "theme_slug": score.get("theme_slug", ""),
+                        "score": score.get("score", ""),
+                        "grade": score.get("grade", ""),
+                        "band": score.get("band", ""),
+                        "raw_value": score.get("raw_value", ""),
+                    }
+                )
+
+        if layout == "flat":
+            if len(rows) < FLAT_PAGE_SIZE:
+                break
+        elif not await next_button_enabled(page):
+            break
+
+        page_no += 1
+        if max_pages_per_block and page_no > max_pages_per_block:
+            raise RuntimeError(f"Exceeded --max-pages-per-block={max_pages_per_block}")
+        if not await click_next_page(page, logger, result_selector):
+            break
+
+    return all_meta_rows, all_score_rows, all_wide_rows, page_no
+
+
 async def scrape_block(
     page,
     year: str,
@@ -840,18 +1230,74 @@ async def scrape_block(
     conf = YEAR_CONFIGS[year]
     result_selector = conf["result_table"]
     layout = conf["layout"]
+    key = block_key(year, state["value"], district["value"], block["value"])
+    baseline = args.baseline_gp_counts.get(key)
+    exception = args.universe_exceptions.get(key)
+    reviewed_name_links = args.gp_name_links.get(key)
+    universe: dict[str, str] = {}
+
+    def audit_count(
+        retrieval: int,
+        live_codes: set[str],
+        status: str,
+        *,
+        missing: set[str] | None = None,
+        unexpected: set[str] | None = None,
+    ) -> None:
+        append_csv_rows(
+            out_dir / "block_count_audit.csv",
+            [
+                {
+                    "run_id": run_id,
+                    "timestamp_utc": utc_now(),
+                    "year": year,
+                    "state": clean_label(state["text"]),
+                    "state_value": state["value"],
+                    "district": clean_label(district["text"]),
+                    "district_value": district["value"],
+                    "block": clean_label(block["text"]),
+                    "block_value": block["value"],
+                    "retrieval": retrieval,
+                    "baseline_gp_rows": "" if baseline is None else baseline,
+                    "universe_gp_rows": len(universe),
+                    "live_gp_rows": len(live_codes),
+                    "delta_from_baseline": "" if baseline is None else len(live_codes) - baseline,
+                    "missing_universe_codes": ";".join(sorted(missing or set())),
+                    "unexpected_score_codes": ";".join(sorted(unexpected or set())),
+                    "status": status,
+                    "exception_evidence": exception["evidence"] if exception else "",
+                }
+            ],
+            BLOCK_COUNT_AUDIT_FIELDS,
+        )
 
     prior = done_status(block_dir)
     if prior and not args.overwrite:
         prior_status = prior.get("status", "")
         prior_rows = int(prior.get("gp_rows", 0) or 0)
-        decision = skip_decision(
-            prior_status,
-            prior_rows,
-            retry_no_data=args.retry_no_data,
-            retry_empty=args.retry_empty,
-            prior_reverified="confirmations" in prior,
-        )
+        required_confirmations = 1 + args.complete_confirm
+        prior_confirmations = int(prior.get("retrieval_confirmations", 0) or 0)
+        decision = None
+        has_universe_contract = prior.get(
+            "universe_contract_version"
+        ) == 1 and cached_universe_is_valid(block_dir, prior)
+        if prior_confirmations >= required_confirmations and has_universe_contract:
+            decision = skip_decision(
+                prior_status,
+                prior_rows,
+                retry_no_data=args.retry_no_data,
+                retry_empty=args.retry_empty,
+                prior_reverified="confirmations" in prior,
+            )
+        else:
+            logger.info(
+                "Rechecking legacy/unconfirmed DONE block (%s/%s confirmations, "
+                "universe contract=%s): %s",
+                prior_confirmations,
+                required_confirmations,
+                has_universe_contract,
+                block_dir,
+            )
         if decision == "no_data":
             logger.info("Skipping block (no data available): %s", block_dir)
             return {
@@ -883,6 +1329,14 @@ async def scrape_block(
     write_json(
         block_dir / "context.json",
         context_obj(run_id, year, page_info, state, district, block, block_dir),
+    )
+    universe = await fetch_gp_universe(
+        page,
+        year=year,
+        state=state,
+        district=district,
+        block=block,
+        block_dir=block_dir,
     )
 
     await ensure_state_district(page, state, district, logger)
@@ -927,6 +1381,23 @@ async def scrape_block(
             raise RuntimeError(f"Indeterminate no-data recheck for {where} (server stress); retry")
 
         if alert_msg:  # still "not available" after all confirmations -> genuine
+            try:
+                universe_check = validate_gp_universe(set(), set(universe), exception)
+            except AssertionError:
+                audit_count(
+                    confirmations,
+                    set(),
+                    "universe_mismatch",
+                    missing=set(universe),
+                )
+                raise
+            audit_count(
+                confirmations,
+                set(),
+                universe_check["status"],
+                missing=universe_check["missing"],
+                unexpected=universe_check["unexpected"],
+            )
             logger.info("[%s] %s: No data available (confirmed x%s)", year, where, confirmations)
             done_obj = {
                 "status": "done_no_data_available",
@@ -948,6 +1419,10 @@ async def scrape_block(
                 "score_rows": 0,
                 "server_message": alert_msg,
                 "confirmations": confirmations,
+                "retrieval_confirmations": confirmations,
+                "universe_contract_version": 1,
+                "universe_gp_rows": len(universe),
+                "universe_exception_evidence": exception["evidence"] if exception else "",
             }
             write_json(done_json, done_obj)
             if failed_json.exists():
@@ -966,10 +1441,6 @@ async def scrape_block(
             f"{clean_label(block['text'])} (server slow/stalled); will retry"
         )
 
-    all_wide_rows: list[dict[str, Any]] = []
-    all_meta_rows: list[dict[str, Any]] = []
-    all_score_rows: list[dict[str, Any]] = []
-
     base_meta = {
         "run_id": run_id,
         "timestamp_utc": utc_now(),
@@ -981,80 +1452,117 @@ async def scrape_block(
         "block": clean_label(block["text"]),
         "block_value": block["value"],
     }
-
-    page_no = 1
-    prev_sig: tuple | None = None
-
-    while True:
-        html_path = html_dir / f"page_{page_no:03d}.html"
-        await save_html(page, html_path)
-
-        parsed = await parse_current_table(page, result_selector, layout)
-        rows = parsed.get("rows", [])
-
-        logger.info(
-            "[%s] %s / %s / %s page %s: parsed %s GP rows",
-            year,
-            clean_label(state["text"]),
-            clean_label(district["text"]),
-            clean_label(block["text"]),
-            page_no,
-            len(rows),
+    all_meta_rows, all_score_rows, all_wide_rows, page_no = await collect_result_pages(
+        page,
+        year=year,
+        state=state,
+        district=district,
+        block=block,
+        base_meta=base_meta,
+        block_dir=block_dir,
+        data_wide_csv=data_wide_csv,
+        html_dir=html_dir,
+        html_prefix="",
+        result_selector=result_selector,
+        layout=layout,
+        max_pages_per_block=args.max_pages_per_block,
+        logger=logger,
+    )
+    link_missing_gp_codes(
+        all_meta_rows,
+        all_score_rows,
+        all_wide_rows,
+        universe,
+        reviewed_name_links,
+    )
+    validate_block_rows(
+        all_meta_rows,
+        all_score_rows,
+        all_wide_rows,
+        allowed_null_scores=args.allowed_null_scores,
+    )
+    live_codes = {str(row["gp_code"]) for row in all_meta_rows}
+    try:
+        universe_check = validate_gp_universe(live_codes, set(universe), exception)
+    except AssertionError:
+        audit_count(
+            1,
+            live_codes,
+            "universe_mismatch",
+            missing=set(universe) - live_codes,
+            unexpected=live_codes - set(universe),
         )
+        raise
+    audit_count(
+        1,
+        live_codes,
+        universe_check["status"],
+        missing=universe_check["missing"],
+        unexpected=universe_check["unexpected"],
+    )
 
-        cur_sig = tuple(item["gp"].get("gp_name", "") for item in rows)
-        if page_no > 1 and cur_sig == prev_sig:
-            # Same page as before -> we have paged past the end (the new-format
-            # #btnNext never disables). Stop without re-appending duplicates.
-            break
-        prev_sig = cur_sig
-
-        for item in rows:
-            gp = item["gp"]
-            meta = enrich_metadata_row(
-                base=base_meta,
-                gp=gp,
-                block_page=page_no,
-                block_dir=block_dir,
-                data_wide_csv=data_wide_csv,
-                html_file=html_path,
-                source_url=page.url,
+    signature = result_signature(all_meta_rows, all_score_rows)
+    for confirmation in range(1, args.complete_confirm + 1):
+        await ensure_state_district(page, state, district, logger)
+        await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
+        confirmation_alert = await click_search(page, logger, result_selector)
+        if confirmation_alert or await page.locator(result_selector).count() == 0:
+            audit_count(confirmation + 1, set(), "unstable_confirmation")
+            raise RuntimeError(f"{where}: confirmation retrieval returned no data/table")
+        confirm_meta, confirm_scores, confirm_wide, _ = await collect_result_pages(
+            page,
+            year=year,
+            state=state,
+            district=district,
+            block=block,
+            base_meta=base_meta,
+            block_dir=block_dir,
+            data_wide_csv=data_wide_csv,
+            html_dir=html_dir,
+            html_prefix=f"confirm_{confirmation:02d}_",
+            result_selector=result_selector,
+            layout=layout,
+            max_pages_per_block=args.max_pages_per_block,
+            logger=logger,
+        )
+        link_missing_gp_codes(
+            confirm_meta,
+            confirm_scores,
+            confirm_wide,
+            universe,
+            reviewed_name_links,
+        )
+        validate_block_rows(
+            confirm_meta,
+            confirm_scores,
+            confirm_wide,
+            allowed_null_scores=args.allowed_null_scores,
+        )
+        confirm_codes = {str(row["gp_code"]) for row in confirm_meta}
+        try:
+            confirm_universe = validate_gp_universe(confirm_codes, set(universe), exception)
+        except AssertionError:
+            audit_count(
+                confirmation + 1,
+                confirm_codes,
+                "universe_mismatch",
+                missing=set(universe) - confirm_codes,
+                unexpected=confirm_codes - set(universe),
             )
-            all_meta_rows.append(meta)
-
-            wide = {**meta}
-            wide.update(item.get("wide", {}))
-            all_wide_rows.append(wide)
-
-            for sc in item.get("scores", []):
-                all_score_rows.append(
-                    {
-                        **meta,
-                        "theme_order": sc.get("theme_order", ""),
-                        "theme_header": sc.get("theme_header", ""),
-                        "theme_slug": sc.get("theme_slug", ""),
-                        "score": sc.get("score", ""),
-                        "grade": sc.get("grade", ""),
-                        "band": sc.get("band", ""),
-                        "raw_value": sc.get("raw_value", ""),
-                    }
-                )
-
-        if layout == "flat":
-            # New page's #btnNext is never disabled; a short page (fewer than
-            # 100 GPs) is the last page, so stop without an extra Next click.
-            if len(rows) < FLAT_PAGE_SIZE:
-                break
-        else:
-            if not await next_button_enabled(page):
-                break
-
-        page_no += 1
-        if args.max_pages_per_block and page_no > args.max_pages_per_block:
-            raise RuntimeError(f"Exceeded --max-pages-per-block={args.max_pages_per_block}")
-
-        if not await click_next_page(page, logger, result_selector):
-            break
+            raise
+        stable = result_signature(confirm_meta, confirm_scores) == signature
+        audit_count(
+            confirmation + 1,
+            confirm_codes,
+            "stable_confirmation" if stable else "unstable_confirmation",
+            missing=confirm_universe["missing"],
+            unexpected=confirm_universe["unexpected"],
+        )
+        if not stable:
+            raise RuntimeError(
+                f"{where}: repeated retrieval changed GP codes or score cells "
+                f"({len(all_meta_rows)} vs {len(confirm_meta)} GPs); retry"
+            )
 
     write_csv_rows(metadata_csv, all_meta_rows, GP_METADATA_FIELDS)
     write_csv_rows(scores_long_csv, all_score_rows, GP_SCORE_FIELDS)
@@ -1079,6 +1587,11 @@ async def scrape_block(
         "html_pages": page_no,
         "gp_rows": len(all_meta_rows),
         "score_rows": len(all_score_rows),
+        "retrieval_confirmations": 1 + args.complete_confirm,
+        "baseline_gp_rows": baseline,
+        "universe_contract_version": 1,
+        "universe_gp_rows": len(universe),
+        "universe_exception_evidence": exception["evidence"] if exception else "",
     }
     write_json(done_json, done_obj)
 
@@ -1493,11 +2006,26 @@ async def main_async(args) -> None:
     out_dir = Path(args.out)
     logger = setup_logger(out_dir)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    args.baseline_gp_counts = (
+        load_baseline_gp_counts(Path(args.baseline_counts_from), args.years)
+        if args.baseline_counts_from
+        else {}
+    )
+    args.universe_exceptions = load_universe_exceptions(
+        Path(args.universe_exceptions) if args.universe_exceptions else None
+    )
+    args.gp_name_links = load_gp_name_links(
+        Path(args.gp_name_links) if args.gp_name_links else None
+    )
+    args.allowed_null_scores = set(load_score_value_exceptions())
 
     logger.info("=" * 90)
     logger.info("PAI resumable scrape run_id=%s", run_id)
     logger.info("Output directory=%s", out_dir.resolve())
     logger.info("Years=%s", args.years)
+    logger.info("Prior-count diagnostics loaded=%s", len(args.baseline_gp_counts))
+    logger.info("Reviewed universe exceptions loaded=%s", len(args.universe_exceptions))
+    logger.info("Reviewed GP-name link blocks loaded=%s", len(args.gp_name_links))
     logger.info("=" * 90)
 
     if args.reset_global_indexes:
@@ -1511,7 +2039,7 @@ async def main_async(args) -> None:
                 logger.info("Removing existing global index: %s", p)
                 p.unlink()
 
-    async with async_playwright() as p:
+    async with async_playwright() as playwright:
         launch_kwargs = {
             "headless": args.headless,
             "slow_mo": args.slow_mo,
@@ -1519,7 +2047,7 @@ async def main_async(args) -> None:
         if args.browser_channel:
             launch_kwargs["channel"] = args.browser_channel
 
-        browser = await p.chromium.launch(**launch_kwargs)
+        browser = await playwright.chromium.launch(**launch_kwargs)
         context = await browser.new_context(
             accept_downloads=True,
             viewport={"width": 1600, "height": 1000},
@@ -1588,7 +2116,23 @@ async def main_async(args) -> None:
 
     logger.info("Done.")
     logger.info("Manifest: %s", (out_dir / "block_manifest.csv").resolve())
-    logger.info("Rebuild global gp_metadata/gp_scores_long with: scripts/pai_rebuild_index.py")
+    if not args.skip_rebuild_derived:
+        from pai_rebuild_index import build, parse_expected
+
+        logger.info("Building typed global Parquet and enforcing collection contracts ...")
+        contract = build(
+            out_dir,
+            out_dir / "derived",
+            parse_expected(args.expected_state_gps),
+            args.years,
+            args.national_official_controls,
+        )
+        logger.info(
+            "Derived contract passed: gp_rows=%s score_rows=%s -> %s",
+            contract["gp_rows"],
+            contract["score_rows"],
+            (out_dir / "derived").resolve(),
+        )
 
 
 def comma_values(value: str | None) -> list[str] | None:
@@ -1632,6 +2176,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit-districts", type=int, default=None)
     parser.add_argument("--limit-blocks", type=int, default=None)
     parser.add_argument("--max-pages-per-block", type=int, default=1000)
+    parser.add_argument(
+        "--baseline-counts-from",
+        help="Prior block store used only for old-vs-live count diagnostics",
+    )
+    parser.add_argument(
+        "--universe-exceptions",
+        help="Reviewed CSV of intentionally unscored GP codes, each with evidence",
+    )
+    parser.add_argument(
+        "--gp-name-links",
+        help="Reviewed CSV linking ambiguous score GP names to universe GP codes",
+    )
 
     parser.add_argument(
         "--overwrite", action="store_true", help="Re-scrape blocks even when DONE.json exists."
@@ -1652,6 +2208,12 @@ def parse_args() -> argparse.Namespace:
         "genuine no-data (0 = trust the first response; default 1). Across-pass re-verification "
         "(--retry-no-data) adds further, time-independent confirmation.",
     )
+    parser.add_argument(
+        "--complete-confirm",
+        type=int,
+        default=1,
+        help="Independent repeat retrievals required after a complete result (default 1)",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--stop-on-error", action="store_true")
 
@@ -1663,6 +2225,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--allow-year-mismatch", action="store_true")
 
     parser.add_argument("--reset-global-indexes", action="store_true")
+    parser.add_argument(
+        "--expected-state-gps",
+        action="append",
+        default=[],
+        metavar="[YEAR:]STATE=N",
+        help="Hard official GP count checked when derived Parquet is built; repeat by state",
+    )
+    parser.add_argument(
+        "--skip-rebuild-derived",
+        action="store_true",
+        help="Do not build typed global Parquet when the scrape finishes",
+    )
+    parser.add_argument(
+        "--national-official-controls",
+        action="store_true",
+        help="Require all 33 PAI 2.0 state controls and the India total at final rebuild",
+    )
 
     return parser.parse_args()
 

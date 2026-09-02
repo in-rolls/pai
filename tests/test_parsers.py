@@ -41,6 +41,8 @@ async def test_legacy_parser_extracts_gp_code():
     assert len(rows) == 4  # Saspol has 4 GPs
     assert rows[0]["gp"]["gp_name"]
     assert rows[0]["gp"]["gp_code"]  # legacy layout carries the GP code
+    assert all(len(row["scores"]) == 10 for row in rows)
+    assert all(row["scores"][0]["theme_slug"] == "overall_pai_score" for row in rows)
 
 
 async def test_layout_dispatch_is_independent():

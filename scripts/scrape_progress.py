@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Analyze PAI scraping progress from block_manifest.csv
+Analyze PAI scraping progress from the block manifest (CSV or parquet).
 
 Usage:
-    python scripts/scrape_progress.py [--year YEAR] [--detailed]
+    python scripts/scrape_progress.py [--data-dir DIR] [--year YEAR] [--detailed]
 """
 
 import argparse
@@ -17,8 +17,8 @@ from pai_common import (  # noqa: E402
     MANIFEST_FAILED,
     MANIFEST_NO_DATA,
     MANIFEST_SUCCESS,
-    read_csv,
 )
+from pai_stores import BlockStore, read_global  # noqa: E402
 
 
 def analyze_progress(rows: list[dict], year: str | None = None) -> dict:
@@ -38,7 +38,7 @@ def analyze_progress(rows: list[dict], year: str | None = None) -> dict:
     no_data_statuses = MANIFEST_NO_DATA
     failed_statuses = MANIFEST_FAILED
 
-    results = {
+    results: dict[str, list[dict]] = {
         "successful": [],
         "no_data": [],
         "failed": [],
@@ -131,29 +131,32 @@ def print_state_coverage(results: dict):
 
 
 def check_csvs_on_disk(data_dir: Path, year: str) -> int:
-    """Count actual CSV files on disk"""
-    year_dir = data_dir / year
-    if not year_dir.exists():
+    """Count blocks that actually hold a data_wide.csv, live or archived."""
+    store = BlockStore(data_dir)
+    if store.mode(year) == "missing":
         return 0
-    return len(list(year_dir.rglob("data_wide.csv")))
+    return sum(1 for blk in store.iter_blocks(year, names={"data_wide.csv"}))
 
 
-def main():
+def main(argv: list[str] | None = None) -> int:
+    default_data = Path(__file__).parent.parent / "data"
     parser = argparse.ArgumentParser(description="Analyze PAI scraping progress")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=default_data,
+        help=f"Collection root (default: {default_data})",
+    )
     parser.add_argument("--year", default="2022-2023", help="Year to analyze")
     parser.add_argument("--detailed", action="store_true", help="Show detailed state coverage")
     parser.add_argument("--failed", action="store_true", help="Show failed blocks by state")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    data_dir = args.data_dir
 
-    base_dir = Path(__file__).parent.parent
-    manifest_path = base_dir / "data" / "block_manifest.csv"
-    data_dir = base_dir / "data"
-
-    if not manifest_path.exists():
-        print(f"Error: Manifest not found at {manifest_path}")
+    rows = read_global(data_dir, "block_manifest")
+    if not rows:
+        print(f"Error: no block_manifest.csv or .parquet under {data_dir}")
         return 1
-
-    rows = read_csv(manifest_path)
     results = analyze_progress(rows, args.year)
 
     print_summary(results, args.year)

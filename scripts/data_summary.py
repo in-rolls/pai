@@ -15,7 +15,6 @@ Usage:
 """
 
 import argparse
-import csv
 import os
 import sys
 from collections import defaultdict
@@ -32,9 +31,9 @@ from pai_common import (  # noqa: E402
     STATUS_NO_DATA,
     STATUS_WITH_DATA,
     YEARS,
-    read_block_status,
     write_csv_rows,
 )
+from pai_stores import BlockStore  # noqa: E402
 
 
 def human_mb(num_bytes: int) -> float:
@@ -54,45 +53,42 @@ def _new_state() -> dict[str, float]:
     }
 
 
-def sum_overall(data_wide: Path) -> tuple[float, int]:
+def sum_overall(rows: list[dict[str, str]]) -> tuple[float, int]:
     """Return (sum, n) of the overall PAI score column in a per-block data_wide.csv."""
     total, n = 0.0, 0
-    try:
-        with data_wide.open(newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                v = row.get(OVERALL_COL, "")
-                if v:
-                    try:
-                        total += float(v)
-                        n += 1
-                    except ValueError:
-                        pass
-    except OSError as e:
-        print(f"warning: could not read {data_wide}: {e}", file=sys.stderr)
+    for row in rows:
+        v = row.get(OVERALL_COL, "")
+        if v:
+            try:
+                total += float(v)
+                n += 1
+            except ValueError:
+                pass
     return total, n
 
 
-def walk_year(year_dir: Path) -> tuple[dict[str, dict], set, int, int]:
-    """Per-state coverage + GP/score counts + overall-score stats + on-disk bytes."""
+def walk_year(store: BlockStore, year: str) -> tuple[dict[str, dict], set, int, int]:
+    """Per-state coverage + GP/score counts + overall-score stats + uncompressed bytes.
+
+    Byte totals come from the store, which reads them from the compaction manifest
+    once a year is archived — so the reported sizes stay the sizes of the data, not
+    of whatever container currently holds it.
+    """
     per_state: dict[str, dict] = defaultdict(_new_state)
     districts: set[tuple[str, str]] = set()
-    data_bytes = 0
-    html_bytes = 0
+    data_bytes, html_bytes = store.sizes(year)
 
-    for root, _dirs, files in os.walk(year_dir):
-        for fn in files:
-            try:
-                sz = os.path.getsize(os.path.join(root, fn))
-            except OSError:
-                continue
-            if fn.endswith(".html"):
-                html_bytes += sz
-            elif fn.endswith((".csv", ".json")):
-                data_bytes += sz
-
-        if DONE_JSON not in files and FAILED_JSON not in files:
+    for blk in store.iter_blocks(year, names={DONE_JSON, FAILED_JSON, DATA_WIDE_CSV}):
+        d = None
+        for name in (DONE_JSON, FAILED_JSON):
+            if blk.exists(name):
+                try:
+                    d = blk.json(name)
+                except ValueError:
+                    d = {"status": "done_unreadable_json"}
+                break
+        if d is None:
             continue
-        d = read_block_status(Path(root)) or {}
         state = d.get("state") or "(unknown)"
         status = d.get("status", "?")
         ps = per_state[state]
@@ -100,7 +96,7 @@ def walk_year(year_dir: Path) -> tuple[dict[str, dict], set, int, int]:
             ps["with_data"] += 1
             ps["gp_count"] += int(d.get("gp_rows", 0) or 0)
             ps["score_rows"] += int(d.get("score_rows", 0) or 0)
-            s, n = sum_overall(Path(root) / DATA_WIDE_CSV)
+            s, n = sum_overall(blk.rows(DATA_WIDE_CSV))
             ps["overall_sum"] += s
             ps["overall_n"] += n
         elif status in STATUS_NO_DATA:
@@ -119,11 +115,11 @@ def build(data_dir: Path, years: list[str]) -> tuple[list[dict], list[dict]]:
     year_rows: list[dict] = []
     state_rows: list[dict] = []
 
+    store = BlockStore(data_dir)
     for year in years:
-        year_dir = data_dir / year
-        if not year_dir.exists():
+        if store.mode(year) == "missing":
             continue
-        per_state, districts, data_bytes, html_bytes = walk_year(year_dir)
+        per_state, districts, data_bytes, html_bytes = walk_year(store, year)
 
         states = sorted(s for s in per_state if s != "(unknown)")
         tot = _new_state()

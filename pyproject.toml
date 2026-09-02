@@ -3,11 +3,30 @@ name = "pai-scraper"
 version = "0.1.0"
 description = "Scraper and data tools for the Panchayat Advancement Index (PAI) Gram Panchayat scores"
 readme = "README.md"
-requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.14"
+authors = [{ name = "Gaurav Sood", email = "contact@gsood.com" }]
+keywords = ["india", "panchayat", "local government", "governance", "data"]
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
 dependencies = [
     "playwright>=1.45",
+    "pyarrow>=18",
     "tqdm>=4.66",
 ]
+
+[project.urls]
+Homepage = "https://github.com/in-rolls/pai"
+Repository = "https://github.com/in-rolls/pai"
+Issues = "https://github.com/in-rolls/pai/issues"
+Changelog = "https://github.com/in-rolls/pai/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
@@ -24,7 +43,7 @@ package = false
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py314"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
@@ -34,5 +53,5 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.mypy]
-python_version = "3.13"
+python_version = "3.14"
 ignore_missing_imports = true

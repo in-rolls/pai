@@ -13,7 +13,7 @@ from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pai_common import read_csv  # noqa: E402
+from pai_stores import BlockStore, read_global  # noqa: E402
 
 
 def main() -> None:
@@ -22,19 +22,28 @@ def main() -> None:
     args = parser.parse_args()
 
     out = Path(args.out)
-    manifest = read_csv(out / "block_manifest.csv")
-    metadata = read_csv(out / "gp_metadata.csv")
-    scores = read_csv(out / "gp_scores_long.csv")
-    inventory = read_csv(out / "dropdown_inventory.csv")
+    store = BlockStore(out)
+    manifest = read_global(out, "block_manifest")
+    metadata = read_global(out, "gp_metadata")
+    scores = read_global(out, "gp_scores_long")
+    inventory = read_global(out, "dropdown_inventory")
 
     print(f"Output dir: {out.resolve()}")
-    print(f"DONE files: {len(list(out.rglob('DONE.json')))}")
-    print(f"FAILED files: {len(list(out.rglob('FAILED.json')))}")
-    print(f"HTML pages: {len(list(out.rglob('page_*.html')))}")
+    for year in store.years():
+        counts = store.counts(year)
+        print(
+            f"{year} [{store.mode(year)}]: DONE {counts['done']:,}  "
+            f"FAILED {counts['failed']:,}  HTML {counts['html']:,}"
+        )
     print(f"Block manifest rows: {len(manifest)}")
     print(f"Dropdown inventory rows: {len(inventory)}")
-    print(f"GP metadata rows: {len(metadata)}")
-    print(f"GP score rows: {len(scores)}")
+    if metadata or scores:
+        print(f"GP metadata rows: {len(metadata)}")
+        print(f"GP score rows: {len(scores)}")
+    else:
+        print(
+            "GP metadata / score rows: not materialized (rebuild with scripts/pai_rebuild_index.py)"
+        )
 
     if manifest:
         print("\nManifest status counts:")
