@@ -9,6 +9,7 @@ one typed, compact Parquet table with one row per year and LGD GP code.
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -41,6 +42,8 @@ DISTRICTS_URL = f"{BASE_URL}/Handlers/Y_Lgd_Districts.ashx"
 BLOCKS_URL = f"{BASE_URL}/Handlers/Y_LGD_Blocks.ashx"
 GPS_URL = f"{BASE_URL}/Handlers/Y_GPs_By_LGD_Block.ashx"
 USER_AGENT = "pai-scraper/0.1 (+https://github.com/in-rolls/pai)"
+ROOT = Path(__file__).parent.parent
+HIERARCHY_EXCLUSIONS = ROOT / "config" / "hierarchy_exclusions.csv"
 
 UNIVERSE_SCHEMA = pa.schema(
     [pa.field(field, pa.string(), nullable=False) for field in GP_UNIVERSE_FIELDS]
@@ -48,6 +51,7 @@ UNIVERSE_SCHEMA = pa.schema(
 
 RequestFn = Callable[[str, float], "HttpResponse"]
 SleepFn = Callable[[float], None]
+HierarchyKey = tuple[str, str, str]
 
 
 @dataclass(frozen=True)
@@ -133,6 +137,34 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def load_hierarchy_exclusions(path: Path) -> dict[HierarchyKey, dict[str, str]]:
+    """Load reviewed district placements that the portal assigns to the wrong state."""
+    exclusions: dict[HierarchyKey, dict[str, str]] = {}
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            key = (
+                row.get("year", "").strip(),
+                row.get("state_value", "").strip(),
+                row.get("district_value", "").strip(),
+            )
+            correct_state = row.get("correct_state_value", "").strip()
+            source_sha256 = row.get("source_sha256", "").strip()
+            evidence = row.get("evidence", "").strip()
+            if (
+                key[0] not in YEAR_CONFIGS
+                or not all(value.isdecimal() for value in key[1:])
+                or not correct_state.isdecimal()
+                or correct_state == key[1]
+                or len(source_sha256) != 64
+                or not evidence
+            ):
+                raise ValueError(f"{path}: every hierarchy exclusion requires valid evidence")
+            if key in exclusions:
+                raise ValueError(f"{path}: duplicate hierarchy exclusion {key}")
+            exclusions[key] = row
+    return exclusions
 
 
 def request_url(url: str, params: Mapping[str, str]) -> str:
@@ -421,6 +453,7 @@ def collect_universe(
     *,
     years: Sequence[str],
     explicit_states: Sequence[tuple[str, str]] = (),
+    hierarchy_exclusions: Mapping[HierarchyKey, Mapping[str, str]] | None = None,
     delay: float = 1.0,
     timeout: float = 120.0,
     retries: int = 3,
@@ -437,11 +470,14 @@ def collect_universe(
         raise ValueError("at least one year is required")
 
     selected_states = validate_explicit_states(explicit_states)
+    hierarchy_exclusions = hierarchy_exclusions or {}
     limiter = RateLimiter(delay, sleeper=sleeper)
     rows: list[dict[str, str]] = []
     counts_by_year: dict[str, dict[str, int]] = {}
     counts_by_state: dict[str, dict[str, int]] = {}
-    excluded_uncontrolled_states: dict[str, list[dict[str, str]]] = {}
+    states_without_published_score_control: dict[str, list[dict[str, str]]] = {}
+    applied_exclusions: list[dict[str, str]] = []
+    expected_exclusions: set[HierarchyKey] = set()
 
     for year in years:
         year_root = out_dir / "source" / year
@@ -469,17 +505,10 @@ def collect_universe(
             selected_state_names = {state["name"] for state in states}
             unknown_names = selected_state_names - expected_state_names
             if unknown_names:
-                if selected_states:
-                    raise ValueError(
-                        f"{year}: explicitly selected states absent from the official PAI "
-                        f"control table: {', '.join(sorted(unknown_names))}"
-                    )
-                excluded_uncontrolled_states[year] = [
+                states_without_published_score_control[year] = [
                     state for state in states if state["name"] in unknown_names
                 ]
-                states = [state for state in states if state["name"] in expected_state_names]
-                selected_state_names = {state["name"] for state in states}
-            if not selected_states and selected_state_names != expected_state_names:
+            if not selected_states and not expected_state_names.issubset(selected_state_names):
                 missing = expected_state_names - selected_state_names
                 raise ValueError(
                     f"{year}: portal state inventory does not match the official PAI control "
@@ -491,6 +520,9 @@ def collect_universe(
         year_gps = 0
         hierarchy_null_sentinels = 0
         for state in states:
+            expected_exclusions.update(
+                key for key in hierarchy_exclusions if key[0] == year and key[1] == state["value"]
+            )
             state_gp_start = len(rows)
             state_root = year_root / f"state={state['value']}"
             hierarchy_params = {
@@ -518,6 +550,15 @@ def collect_universe(
             year_districts += len(districts)
 
             for district in districts:
+                exclusion_key = (year, state["value"], district["value"])
+                if exclusion_key in hierarchy_exclusions:
+                    applied_exclusions.append(
+                        {
+                            **dict(hierarchy_exclusions[exclusion_key]),
+                            "district": district["name"],
+                        }
+                    )
+                    continue
                 district_root = state_root / f"district={district['value']}"
                 block_params = hierarchy_params | {"ZID": district["value"]}
                 block_response = load_or_fetch(
@@ -582,16 +623,14 @@ def collect_universe(
 
             state_gp_rows = len(rows) - state_gp_start
             counts_by_state[f"{year}:{state['value']}"] = {
-                "gp_endpoint_rows": state_gp_rows,
-                "official_final_gp_count": (
-                    official_counts[state["name"]] if official_counts else -1
+                "hierarchy_gp_rows": state_gp_rows,
+                "published_scored_gp_count": (
+                    official_counts.get(state["name"], -1) if official_counts else -1
                 ),
             }
-            if official_counts and state_gp_rows != official_counts[state["name"]]:
-                raise ValueError(
-                    f"{year} {state['name']}: official hierarchy returned "
-                    f"{state_gp_rows:,} GPs, expected {official_counts[state['name']]:,} "
-                    f"from {OFFICIAL_FINAL_GP_COUNTS_SOURCE}"
+            if official_counts and state["name"] in official_counts:
+                counts_by_state[f"{year}:{state['value']}"]["hierarchy_minus_published"] = (
+                    state_gp_rows - official_counts[state["name"]]
                 )
 
         counts_by_year[year] = {
@@ -602,12 +641,20 @@ def collect_universe(
             "hierarchy_null_sentinels": hierarchy_null_sentinels,
         }
         if official_counts and not selected_states:
-            official_india = official_counts["__india__"]
-            if year_gps != official_india:
-                raise ValueError(
-                    f"{year}: official hierarchy returned {year_gps:,} GPs, expected "
-                    f"India total {official_india:,} from {OFFICIAL_FINAL_GP_COUNTS_SOURCE}"
-                )
+            counts_by_year[year]["published_scored_gp_count"] = official_counts["__india__"]
+            counts_by_year[year]["hierarchy_minus_published"] = (
+                year_gps - official_counts["__india__"]
+            )
+
+    observed_exclusions = {
+        (row["year"], row["state_value"], row["district_value"]) for row in applied_exclusions
+    }
+    if observed_exclusions != expected_exclusions:
+        raise ValueError(
+            "reviewed hierarchy exclusions did not match the portal inventory: "
+            f"missing={sorted(expected_exclusions - observed_exclusions)}, "
+            f"unexpected={sorted(observed_exclusions - expected_exclusions)}"
+        )
 
     keys = [(row["year"], row["gp_code"]) for row in rows]
     if len(keys) != len(set(keys)):
@@ -648,7 +695,8 @@ def collect_universe(
         "years": list(years),
         "counts_by_year": counts_by_year,
         "counts_by_state": counts_by_state,
-        "excluded_uncontrolled_states": excluded_uncontrolled_states,
+        "states_without_published_score_control": states_without_published_score_control,
+        "hierarchy_exclusions_applied": applied_exclusions,
         "row_count": table.num_rows,
         "key": ["year", "gp_code"],
         "parquet": {
@@ -693,6 +741,12 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="LABEL=VALUE",
         help="limit collection to an explicit state; repeat as needed",
     )
+    parser.add_argument(
+        "--hierarchy-exclusions",
+        type=Path,
+        default=HIERARCHY_EXCLUSIONS,
+        help="reviewed wrong-state district placements to exclude",
+    )
     parser.add_argument("--delay", type=float, default=1.0, help="seconds between HTTP requests")
     parser.add_argument("--timeout", type=float, default=120.0, help="HTTP timeout in seconds")
     parser.add_argument("--retries", type=int, default=3, help="retries after the first attempt")
@@ -711,6 +765,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         args.out,
         years=args.years,
         explicit_states=args.state,
+        hierarchy_exclusions=load_hierarchy_exclusions(args.hierarchy_exclusions),
         delay=args.delay,
         timeout=args.timeout,
         retries=args.retries,

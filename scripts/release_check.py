@@ -41,7 +41,7 @@ def check(version: str) -> None:
     manifest = verify(ROOT / "data" / "release")
     print(
         f"Ready for independent review: v{version}, "
-        f"{manifest['files']['pai_gp_scores.parquet']['rows']:,} GP-year rows"
+        f"{manifest['files']['pai_gp.parquet']['rows']:,} GP-year rows"
     )
     print(f"After review and green CI: git tag -a {tag} -m 'Release {tag}'")
 

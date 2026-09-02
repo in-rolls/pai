@@ -16,6 +16,7 @@ from typing import Any
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pai_collect_universe import HIERARCHY_EXCLUSIONS, load_hierarchy_exclusions
 from pai_common import (
     CANONICAL_THEME_SLUGS,
     GP_UNIVERSE_FIELDS,
@@ -39,6 +40,34 @@ SCORE_ID_FIELDS = [
 ]
 SCORE_FIELDS = [f"{slug}_score" for slug in CANONICAL_THEME_SLUGS]
 PACKAGE_SCORE_FIELDS = [*SCORE_ID_FIELDS, *SCORE_FIELDS]
+PUBLIC_UNIVERSE_FIELDS = [
+    "year",
+    "state",
+    "state_value",
+    "district",
+    "district_value",
+    "block",
+    "block_value",
+    "gp_code",
+    "gp_name",
+    "hierarchy_source_url",
+    "hierarchy_retrieved_utc",
+    "hierarchy_source_sha256",
+]
+PUBLIC_FIELDS = [
+    *PUBLIC_UNIVERSE_FIELDS,
+    "score_available",
+    "scorecard_url",
+    *SCORE_FIELDS,
+]
+PUBLIC_SCHEMA = pa.schema(
+    [
+        *[pa.field(field, pa.string(), nullable=False) for field in PUBLIC_UNIVERSE_FIELDS],
+        pa.field("score_available", pa.bool_(), nullable=False),
+        pa.field("scorecard_url", pa.string()),
+        *[pa.field(field, pa.float64()) for field in SCORE_FIELDS],
+    ]
+)
 REQUIRED_RELEASE_YEARS = tuple(YEAR_CONFIGS)
 MAX_GIT_FILE_BYTES = 50 * 1024 * 1024
 
@@ -51,7 +80,7 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def project_scores(source: Path, destination: Path) -> pa.Table:
+def project_scores(source: Path) -> pa.Table:
     """Project the validated wide table to the stable public score schema."""
     table = pq.read_table(source, columns=PACKAGE_SCORE_FIELDS)
     expected = pa.schema(
@@ -69,13 +98,11 @@ def project_scores(source: Path, destination: Path) -> pa.Table:
     keys = [(str(row["year"]), str(row["gp_code"])) for row in rows]
     if len(keys) != len(set(keys)):
         raise AssertionError("public score data contain duplicate (year, gp_code) keys")
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    pq.write_table(table, destination, compression="zstd", compression_level=7)
     return table
 
 
-def copy_universe(source: Path, destination: Path) -> pa.Table:
-    """Copy the official denominator using its exact declared schema."""
+def read_universe(source: Path) -> pa.Table:
+    """Read the full hierarchy denominator using its exact declared schema."""
     table = pq.read_table(source)
     expected = typed_schema(GP_UNIVERSE_FIELDS, "universe")
     if table.schema != expected:
@@ -93,8 +120,126 @@ def copy_universe(source: Path, destination: Path) -> pa.Table:
     )
     if len(keys) != len(set(keys)):
         raise AssertionError("public universe contains duplicate (year, gp_code) keys")
-    pq.write_table(table, destination, compression="zstd", compression_level=7)
     return table
+
+
+def build_public_table(
+    scores: pa.Table,
+    universe: pa.Table,
+    destination: Path,
+    hierarchy_exclusions: dict[tuple[str, str, str], dict[str, str]] | None = None,
+) -> tuple[pa.Table, list[dict[str, str]]]:
+    """Left-join scores onto the full GP universe without imputing missing outcomes."""
+    hierarchy_exclusions = hierarchy_exclusions or {}
+    score_rows = {(str(row["year"]), str(row["gp_code"])): row for row in scores.to_pylist()}
+    universe_rows = universe.to_pylist()
+    universe_keys = {(str(row["year"]), str(row["gp_code"])) for row in universe_rows}
+    unexpected = sorted(set(score_rows) - universe_keys)
+    if unexpected:
+        raise AssertionError(f"public scores contain GPs outside the universe: {unexpected[:10]}")
+
+    rows: list[dict[str, Any]] = []
+    corrections: list[dict[str, str]] = []
+    for source in universe_rows:
+        key = (str(source["year"]), str(source["gp_code"]))
+        score = score_rows.get(key)
+        if score is not None:
+            mismatches = [
+                field
+                for field in ("state_value", "district_value", "block_value")
+                if str(score[field]) != str(source[field])
+            ]
+            if mismatches:
+                exclusion_key = (key[0], str(score["state_value"]), str(score["district_value"]))
+                exclusion = hierarchy_exclusions.get(exclusion_key)
+                reviewed = (
+                    mismatches == ["state_value"]
+                    and exclusion is not None
+                    and exclusion["correct_state_value"] == str(source["state_value"])
+                )
+                if not reviewed:
+                    raise AssertionError(
+                        f"score/universe hierarchy differs for {key}: {sorted(mismatches)}"
+                    )
+                corrections.append(
+                    {
+                        "year": key[0],
+                        "gp_code": key[1],
+                        "district_value": str(source["district_value"]),
+                        "score_state_value": str(score["state_value"]),
+                        "hierarchy_state_value": str(source["state_value"]),
+                    }
+                )
+        rows.append(
+            {
+                "year": source["year"],
+                "state": source["state"],
+                "state_value": source["state_value"],
+                "district": source["district"],
+                "district_value": source["district_value"],
+                "block": source["block"],
+                "block_value": source["block_value"],
+                "gp_code": source["gp_code"],
+                "gp_name": source["gp_name"],
+                "hierarchy_source_url": source["source_url"],
+                "hierarchy_retrieved_utc": source["retrieved_utc"],
+                "hierarchy_source_sha256": source["source_sha256"],
+                "score_available": score is not None,
+                "scorecard_url": score["scorecard_url"] if score is not None else None,
+                **{field: score[field] if score is not None else None for field in SCORE_FIELDS},
+            }
+        )
+    rows.sort(
+        key=lambda row: (
+            row["year"],
+            row["state_value"],
+            row["district_value"],
+            row["block_value"],
+            row["gp_code"],
+        )
+    )
+    table = pa.Table.from_pylist(rows, schema=PUBLIC_SCHEMA)
+    if table.column_names != PUBLIC_FIELDS:
+        raise AssertionError("public table field order changed")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table, destination, compression="zstd", compression_level=7)
+    return table, corrections
+
+
+def coverage_audit(table: pa.Table) -> dict[str, dict[str, int]]:
+    """Count hierarchy, scored, and unscored rows by vintage."""
+    rows = table.select(["year", "score_available"]).to_pylist()
+    audit: dict[str, dict[str, int]] = {}
+    for year in sorted({str(row["year"]) for row in rows}):
+        selected = [row for row in rows if row["year"] == year]
+        scored = sum(bool(row["score_available"]) for row in selected)
+        audit[year] = {
+            "universe_rows": len(selected),
+            "scored_rows": scored,
+            "unscored_rows": len(selected) - scored,
+        }
+    return audit
+
+
+def state_coverage_audit(table: pa.Table) -> dict[str, dict[str, int | str]]:
+    """Expose score availability by state so selection is visible to analysts."""
+    rows = table.select(["year", "state", "state_value", "score_available"]).to_pylist()
+    counts: dict[str, dict[str, int | str]] = {}
+    for row in rows:
+        key = f"{row['year']}:{row['state_value']}"
+        entry = counts.setdefault(
+            key,
+            {
+                "state": str(row["state"]),
+                "universe_rows": 0,
+                "scored_rows": 0,
+                "unscored_rows": 0,
+            },
+        )
+        entry["universe_rows"] = int(entry["universe_rows"]) + 1
+        field = "scored_rows" if row["score_available"] else "unscored_rows"
+        entry[field] = int(entry[field]) + 1
+    return dict(sorted(counts.items()))
 
 
 def validate_release_coverage(table: pa.Table) -> dict[str, dict[str, int]]:
@@ -219,7 +364,7 @@ def validate_git_sizes(files: dict[str, dict[str, Any]]) -> int:
 
 
 def build(derived_dir: Path, out: Path) -> dict[str, Any]:
-    """Create and atomically promote a checked two-table public data package."""
+    """Create and atomically promote a checked universe-left public data package."""
     source_manifest = derived_dir / "collection_manifest.json"
     scores_source = derived_dir / "gp_scores_wide.parquet"
     universe_source = derived_dir / "gp_universe.parquet"
@@ -231,44 +376,29 @@ def build(derived_dir: Path, out: Path) -> dict[str, Any]:
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{out.name}.staging-", dir=out.parent) as name:
         stage = Path(name)
-        scores_path = stage / "pai_gp_scores.parquet"
-        universe_path = stage / "pai_gp_universe.parquet"
-        scores = project_scores(scores_source, scores_path)
-        universe = copy_universe(universe_source, universe_path)
+        public_path = stage / "pai_gp.parquet"
+        scores = project_scores(scores_source)
+        universe = read_universe(universe_source)
         official_counts_checked = validate_release_coverage(scores)
         score_quality = validate_score_values(scores)
-        score_keys = set(
-            zip(
-                scores.column("year").to_pylist(),
-                scores.column("gp_code").to_pylist(),
-                strict=True,
-            )
+        public, hierarchy_corrections = build_public_table(
+            scores,
+            universe,
+            public_path,
+            load_hierarchy_exclusions(HIERARCHY_EXCLUSIONS),
         )
-        universe_keys = set(
-            zip(
-                universe.column("year").to_pylist(),
-                universe.column("gp_code").to_pylist(),
-                strict=True,
-            )
-        )
-        if score_keys != universe_keys:
-            raise AssertionError(
-                "public scores and universe differ: "
-                f"unscored={len(universe_keys - score_keys)}, "
-                f"unexpected={len(score_keys - universe_keys)}"
-            )
-        files = {
-            scores_path.name: file_entry(scores_path),
-            universe_path.name: file_entry(universe_path),
-        }
+        files = {public_path.name: file_entry(public_path)}
         manifest = {
             "version": package_version(),
             "created_utc": datetime.now(UTC).isoformat(timespec="seconds"),
-            "unit": "one Gram Panchayat in one PAI fiscal-year vintage",
+            "unit": "one hierarchy Gram Panchayat in one PAI fiscal-year vintage",
             "key": ["year", "gp_code"],
             "years": list(REQUIRED_RELEASE_YEARS),
             "official_counts_checked": official_counts_checked,
             "score_quality": score_quality,
+            "coverage": coverage_audit(public),
+            "coverage_by_state": state_coverage_audit(public),
+            "score_hierarchy_corrections": hierarchy_corrections,
             "package_bytes": validate_git_sizes(files),
             "source_collection_manifest_sha256": sha256_file(source_manifest),
             "files": files,

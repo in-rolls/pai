@@ -22,7 +22,9 @@ def _small_release_contract(monkeypatch):
     monkeypatch.setattr(package, "load_score_value_exceptions", lambda: {})
 
 
-def _derived(root, *, universe_code="100", score_code="100", score_value=50.0):
+def _derived(
+    root, *, universe_code="100", score_code="100", score_value=50.0, extra_unscored=False
+):
     root.mkdir()
     score_row = {
         "year": "2023-2024",
@@ -47,23 +49,27 @@ def _derived(root, *, universe_code="100", score_code="100", score_value=50.0):
         pa.Table.from_pylist([score_row], schema=score_schema),
         root / "gp_scores_wide.parquet",
     )
-    universe_row = {
-        "year": "2023-2024",
-        "state": "Uttar Pradesh",
-        "state_value": "9",
-        "district": "D",
-        "district_value": "1",
-        "block": "B",
-        "block_value": "2",
-        "gp_code": universe_code,
-        "gp_name": "GP",
-        "source_url": "https://pai.gov.in/handler",
-        "retrieved_utc": "2026-09-01T00:00:00+00:00",
-        "source_sha256": "a" * 64,
-    }
+    universe_rows = []
+    for code in [universe_code, "101"] if extra_unscored else [universe_code]:
+        universe_rows.append(
+            {
+                "year": "2023-2024",
+                "state": "Uttar Pradesh",
+                "state_value": "9",
+                "district": "D",
+                "district_value": "1",
+                "block": "B",
+                "block_value": "2",
+                "gp_code": code,
+                "gp_name": "GP" if code == universe_code else "Unscored GP",
+                "source_url": "https://pai.gov.in/handler",
+                "retrieved_utc": "2026-09-01T00:00:00+00:00",
+                "source_sha256": "a" * 64,
+            }
+        )
     pq.write_table(
         pa.Table.from_pylist(
-            [universe_row], schema=pai_contracts.typed_schema(c.GP_UNIVERSE_FIELDS, "universe")
+            universe_rows, schema=pai_contracts.typed_schema(c.GP_UNIVERSE_FIELDS, "universe")
         ),
         root / "gp_universe.parquet",
     )
@@ -78,7 +84,7 @@ def _derived(root, *, universe_code="100", score_code="100", score_value=50.0):
     (root / "collection_manifest.json").write_text(json.dumps({"derived": derived}))
 
 
-def test_data_package_builds_two_checked_parquets(tmp_path):
+def test_data_package_builds_one_universe_left_parquet(tmp_path):
     derived = tmp_path / "derived"
     _derived(derived)
     out = tmp_path / "release"
@@ -86,13 +92,10 @@ def test_data_package_builds_two_checked_parquets(tmp_path):
 
     assert sorted(path.name for path in out.iterdir()) == [
         "MANIFEST.json",
-        "pai_gp_scores.parquet",
-        "pai_gp_universe.parquet",
+        "pai_gp.parquet",
     ]
-    assert pq.read_table(out / "pai_gp_scores.parquet").column_names == (
-        package.PACKAGE_SCORE_FIELDS
-    )
-    assert manifest["files"]["pai_gp_scores.parquet"]["rows"] == 1
+    assert pq.read_table(out / "pai_gp.parquet").column_names == package.PUBLIC_FIELDS
+    assert manifest["files"]["pai_gp.parquet"]["rows"] == 1
     assert manifest["key"] == ["year", "gp_code"]
     assert verify_data_package.verify(out)["version"] == package.package_version()
 
@@ -104,7 +107,7 @@ def test_data_package_builds_two_checked_parquets(tmp_path):
 @pytest.mark.parametrize(
     ("universe_code", "score_code", "message"),
     [
-        ("101", "100", "scores and universe differ"),
+        ("101", "100", "scores contain GPs outside the universe"),
         ("100", "", "identity field gp_code contains blanks"),
     ],
 )
@@ -161,3 +164,27 @@ def test_data_package_refuses_git_warning_sized_files(tmp_path, monkeypatch):
     monkeypatch.setattr(package, "MAX_GIT_FILE_BYTES", 1)
     with pytest.raises(AssertionError, match="50 MiB Git warning threshold"):
         package.build(derived, tmp_path / "release")
+
+
+def test_unscored_universe_gp_is_retained_with_null_scores(tmp_path):
+    derived = tmp_path / "derived"
+    _derived(derived, extra_unscored=True)
+    out = tmp_path / "release"
+    manifest = package.build(derived, out)
+    rows = pq.read_table(out / "pai_gp.parquet").to_pylist()
+    assert len(rows) == 2
+    unscored = next(row for row in rows if row["gp_code"] == "101")
+    assert unscored["score_available"] is False
+    assert unscored["scorecard_url"] is None
+    assert all(unscored[field] is None for field in package.SCORE_FIELDS)
+    assert manifest["coverage"]["2023-2024"] == {
+        "universe_rows": 2,
+        "scored_rows": 1,
+        "unscored_rows": 1,
+    }
+    assert manifest["coverage_by_state"]["2023-2024:9"] == {
+        "state": "Uttar Pradesh",
+        "universe_rows": 2,
+        "scored_rows": 1,
+        "unscored_rows": 1,
+    }

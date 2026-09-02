@@ -1,0 +1,4 @@
+year,state_value,district_value,correct_state_value,source_sha256,evidence
+2022-2023,22,340,20,e195cd201e2db461117d273f0d889c7f2bce0a1549ebb7f141c35e4f421c1de9,PAI handler lists Sahebganj under both Chhattisgarh and Jharkhand; LGD district 340 and the PAI score hierarchy place it in Jharkhand
+2022-2023,22,426,23,e195cd201e2db461117d273f0d889c7f2bce0a1549ebb7f141c35e4f421c1de9,PAI handler lists Satna under both Chhattisgarh and Madhya Pradesh; LGD district 426 and the PAI score hierarchy place it in Madhya Pradesh
+2022-2023,22,442,24,e195cd201e2db461117d273f0d889c7f2bce0a1549ebb7f141c35e4f421c1de9,PAI handler lists Bharuch under both Chhattisgarh and Gujarat; LGD district 442 and the PAI score hierarchy place it in Gujarat

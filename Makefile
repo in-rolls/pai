@@ -20,7 +20,7 @@ test:                ## Run the test suite
 
 check: lint test     ## Lint + test
 
-data-package:        ## Build the committed two-table package from a validated derived bundle
+data-package:        ## Build the committed universe-left package from a validated derived bundle
 	uv run scripts/build_data_package.py --derived-dir $(DERIVED) --out $(DATA_RELEASE)
 
 verify-data:         ## Verify the committed package schemas, keys, counts, and checksums

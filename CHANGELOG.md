@@ -14,10 +14,14 @@ changes most likely to affect an analysis already in progress.
   reviewed ten-score vectors rather than display order.
 - Twenty-two official blank PAI 1.0 Healthy Panchayat values remain null and are documented;
   they are never changed to zero.
+- Three PAI 1.0 district placements incorrectly duplicated under Chhattisgarh are excluded through
+  a reviewed ledger; four affected score rows take their canonical state from the valid hierarchy.
+- Blank or truncated PAI 1.0 display IDs are replaced by the full LGD code encoded in each retained
+  scorecard URL.
 
 ### Added
 
-- A versioned data package containing one compact GP-year score table, the official GP universe,
-  and a checksummed manifest.
+- A versioned, universe-left GP-year table with explicit score availability and a checksummed
+  manifest.
 - Hard release checks for typed schemas, nonblank identities, unique `(year, gp_code)` keys,
-  exact score-to-universe reconciliation, repository cleanliness, and tag/version consistency.
+  score membership in the full hierarchy, repository cleanliness, and tag/version consistency.

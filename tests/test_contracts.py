@@ -207,6 +207,16 @@ def test_historical_key_uses_full_lgd_code_encoded_in_scorecard_url():
     assert pai_contracts.gp_key(row) == ("2022-2023", "scorecard_lgd", "198681")
 
 
+def test_scorecard_url_repairs_blank_and_truncated_codes_in_every_table():
+    metadata, scores, wide = make_rows(1)
+    for rows in (metadata, scores, wide):
+        for row in rows:
+            row["gp_code"] = "1986"
+            row["scorecard_url"] = "/PS/Public/SC.aspx?gp_id=MTk4Njgx"
+    assert pai_contracts.canonicalize_score_gp_codes(metadata, scores, wide) == 12
+    assert {row["gp_code"] for rows in (metadata, scores, wide) for row in rows} == {"198681"}
+
+
 def test_ambiguous_gp_name_requires_reviewed_link():
     metadata, scores, wide = make_rows(1)
     for rows in (metadata, scores, wide):
@@ -382,6 +392,45 @@ def test_cached_universe_provenance_is_verified_before_parquet(tmp_path):
         pai_rebuild_index.write_universe_from_store(
             broken, broken / "universe.parquet", ["2023-2024"]
         )
+
+
+def test_full_universe_can_contain_unscored_gps_but_not_vice_versa(tmp_path):
+    universe_path = tmp_path / "universe.parquet"
+    metadata_path = tmp_path / "metadata.parquet"
+    universe_rows = []
+    for code in ("100", "101"):
+        universe_rows.append(
+            {
+                "year": "2023-2024",
+                "state": "Uttar Pradesh",
+                "state_value": "9",
+                "district": "D",
+                "district_value": "1",
+                "block": "B",
+                "block_value": "2",
+                "gp_code": code,
+                "gp_name": f"GP {code}",
+                "source_url": "https://pai.gov.in/handler",
+                "retrieved_utc": "2026-09-01T00:00:00+00:00",
+                "source_sha256": "a" * 64,
+            }
+        )
+    pq.write_table(
+        pa.Table.from_pylist(
+            universe_rows, schema=pai_contracts.typed_schema(c.GP_UNIVERSE_FIELDS, "universe")
+        ),
+        universe_path,
+    )
+    pq.write_table(pa.table({"year": ["2023-2024"], "gp_code": ["100"]}), metadata_path)
+    assert pai_contracts.validate_universe_parquet(universe_path, metadata_path) == {
+        "universe_rows": 2,
+        "scored_universe_rows": 1,
+        "unscored_universe_rows": 1,
+    }
+
+    pq.write_table(pa.table({"year": ["2023-2024"], "gp_code": ["999"]}), metadata_path)
+    with pytest.raises(AssertionError, match="outside the hierarchy universe"):
+        pai_contracts.validate_universe_parquet(universe_path, metadata_path)
 
 
 def test_rebuild_promotes_only_complete_valid_bundle_and_manifest_is_portable(tmp_path):

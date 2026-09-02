@@ -210,7 +210,7 @@ def test_collect_rejects_gp_code_reused_across_blocks(tmp_path: Path):
         )
 
 
-def test_pai2_explicit_state_must_match_official_control(tmp_path: Path, monkeypatch):
+def test_pai2_hierarchy_and_published_score_counts_are_distinct(tmp_path: Path, monkeypatch):
     monkeypatch.setitem(
         universe.OFFICIAL_FINAL_GP_COUNTS,
         "2023-2024",
@@ -218,19 +218,33 @@ def test_pai2_explicit_state_must_match_official_control(tmp_path: Path, monkeyp
     )
 
     portal = FakePortal()
-    with pytest.raises(ValueError, match="returned 1 GPs, expected 2"):
-        universe.collect_universe(
-            tmp_path,
-            years=["2023-2024"],
-            explicit_states=[("Uttar Pradesh", "9")],
-            delay=0,
-            retry_backoff=0,
-            request_fn=portal,
-            sleeper=lambda _seconds: None,
-        )
+    table, manifest = universe.collect_universe(
+        tmp_path,
+        years=["2023-2024"],
+        explicit_states=[("Uttar Pradesh", "9")],
+        delay=0,
+        retry_backoff=0,
+        request_fn=portal,
+        sleeper=lambda _seconds: None,
+    )
 
-    assert list((tmp_path / "source").rglob("gps.json"))
-    assert not (tmp_path / "gp_universe.parquet").exists()
+    assert table.num_rows == 1
+    assert manifest["counts_by_state"]["2023-2024:9"] == {
+        "hierarchy_gp_rows": 1,
+        "published_scored_gp_count": 2,
+        "hierarchy_minus_published": -1,
+    }
+
+
+def test_repository_hierarchy_exclusions_are_evidenced_and_exact():
+    exclusions = universe.load_hierarchy_exclusions(universe.HIERARCHY_EXCLUSIONS)
+    assert set(exclusions) == {
+        ("2022-2023", "22", "340"),
+        ("2022-2023", "22", "426"),
+        ("2022-2023", "22", "442"),
+    }
+    assert {row["correct_state_value"] for row in exclusions.values()} == {"20", "23", "24"}
+    assert all(len(row["source_sha256"]) == 64 for row in exclusions.values())
 
 
 def test_fetch_retries_transient_status_only_within_bound():

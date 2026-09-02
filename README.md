@@ -7,15 +7,16 @@ PAI vintages.
 
 ## Versioned data package
 
-Each data release uses a `v*` tag to pin three files under `data/release/`:
+Each data release uses a `v*` tag to pin two files under `data/release/`:
 
 | file | grain | purpose |
 | --- | --- | --- |
-| `pai_gp_scores.parquet` | one GP × PAI vintage | stable identifiers and ten numeric scores |
-| `pai_gp_universe.parquet` | one official GP × PAI vintage | denominator, LGD names/codes, and handler provenance |
+| `pai_gp.parquet` | one hierarchy GP × PAI vintage | denominator, score availability, and ten nullable scores |
 | `MANIFEST.json` | one release | version, schemas, row counts, byte sizes, and SHA-256 checksums |
 
-The score table deliberately omits scraper paths, raw display strings, and redundant grades.
+The table retains GPs without a published score and distinguishes them with `score_available`;
+their score columns remain null, never zero. It omits scraper paths, raw display strings, and
+redundant grades.
 The raw HTML and resumable cache remain in Dataverse rather than enlarging every Git checkout.
 See [`DATA_DICTIONARY.md`](DATA_DICTIONARY.md) for column definitions and
 [`CHANGELOG.md`](CHANGELOG.md) for corrections between tags.
@@ -23,8 +24,8 @@ See [`DATA_DICTIONARY.md`](DATA_DICTIONARY.md) for column definitions and
 ```python
 import pyarrow.parquet as pq
 
-scores = pq.read_table("data/release/pai_gp_scores.parquet")
-universe = pq.read_table("data/release/pai_gp_universe.parquet")
+gps = pq.read_table("data/release/pai_gp.parquet")
+scores = gps.filter(gps["score_available"])
 ```
 
 ## Data
@@ -206,8 +207,9 @@ Each `derived/` directory contains `gp_scores_wide.parquet` (canonical one row p
 Identifiers remain strings; scores and count/order fields are numeric. The build asserts unique
 GP-year keys (LGD code where present, documented location/name fallback otherwise), exactly ten
 unique scores per GP, one overall score, scores in `[0, 100]`, and row conservation against every
-successful `DONE.json`. The universe table requires unique `(year, gp_code)` keys and exact
-reconciliation to the score metadata. All large CSV conversion and global validation runs in
+successful `DONE.json`. The universe table requires unique `(year, gp_code)` keys and requires
+every scored GP to belong to the hierarchy; hierarchy GPs without scores are retained. All large
+CSV conversion and global validation runs in
 bounded Arrow record batches rather than materializing the national long table in memory.
 
 `build_release.py` emits a compact data-only archive by default. Use `--include-cache` only when

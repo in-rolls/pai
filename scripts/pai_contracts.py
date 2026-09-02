@@ -416,10 +416,8 @@ def _coerce(value: Any, dtype: pa.DataType) -> Any:
     return str(value)
 
 
-def gp_key(row: dict[str, Any]) -> tuple[str, ...]:
-    """Stable GP-year key; LGD code is preferred, location/name explains legacy fallback."""
-    year = str(row.get("year") or "")
-    scorecard_url = str(row.get("scorecard_url") or "")
+def scorecard_gp_code(scorecard_url: str) -> str:
+    """Decode the full LGD GP code embedded in a PAI scorecard URL."""
     encoded = parse_qs(urlparse(scorecard_url).query).get("gp_id", [""])[0]
     if encoded:
         try:
@@ -428,7 +426,28 @@ def gp_key(row: dict[str, Any]) -> tuple[str, ...]:
         except ValueError, UnicodeDecodeError:
             decoded = ""
         if decoded.isdecimal():
-            return (year, "scorecard_lgd", decoded)
+            return decoded
+    return ""
+
+
+def canonicalize_score_gp_codes(*tables: list[dict[str, Any]]) -> int:
+    """Replace blank or truncated display codes with URL-encoded LGD codes."""
+    changed = 0
+    for rows in tables:
+        for row in rows:
+            decoded = scorecard_gp_code(str(row.get("scorecard_url") or ""))
+            if decoded and str(row.get("gp_code") or "").strip() != decoded:
+                row["gp_code"] = decoded
+                changed += 1
+    return changed
+
+
+def gp_key(row: dict[str, Any]) -> tuple[str, ...]:
+    """Stable GP-year key; LGD code is preferred, location/name explains legacy fallback."""
+    year = str(row.get("year") or "")
+    decoded = scorecard_gp_code(str(row.get("scorecard_url") or ""))
+    if decoded:
+        return (year, "scorecard_lgd", decoded)
     code = str(row.get("gp_code") or "").strip()
     if code:
         return (year, "lgd", code)
@@ -709,7 +728,7 @@ def official_state_expectations(
 
 
 def validate_universe_parquet(universe: Path, metadata: Path) -> dict[str, int]:
-    """Validate the typed handler universe and exact score-denominator reconciliation."""
+    """Validate the full handler denominator and score membership within it."""
     universe_file = pq.ParquetFile(universe)
     if universe_file.schema_arrow != typed_schema(GP_UNIVERSE_FIELDS, "universe"):
         raise AssertionError("gp_universe.parquet has an unexpected schema")
@@ -731,14 +750,17 @@ def validate_universe_parquet(universe: Path, metadata: Path) -> dict[str, int]:
             if not key[1]:
                 raise AssertionError("metadata cannot reconcile to universe with blank gp_code")
             score_keys.add(key)
-    if universe_keys != score_keys:
-        missing_scores = sorted(universe_keys - score_keys)[:10]
+    if not score_keys.issubset(universe_keys):
         unexpected_scores = sorted(score_keys - universe_keys)[:10]
         raise AssertionError(
-            "score metadata and GP universe differ: "
-            f"unscored_universe={missing_scores}, unexpected_scores={unexpected_scores}"
+            "score metadata contain GPs outside the hierarchy universe: "
+            f"unexpected_scores={unexpected_scores}"
         )
-    return {"universe_rows": len(universe_keys), "universe_score_keys": len(score_keys)}
+    return {
+        "universe_rows": len(universe_keys),
+        "scored_universe_rows": len(score_keys),
+        "unscored_universe_rows": len(universe_keys - score_keys),
+    }
 
 
 def sha256_file(path: Path) -> str:
@@ -782,7 +804,7 @@ def write_collection_manifest(
         },
         "universe_key_contract": {
             "key": ["year", "gp_code"],
-            "cardinality": "one official handler row per GP-year; exact metadata reconciliation",
+            "cardinality": "one valid handler row per GP-year; every score belongs to universe",
         },
     }
     dst.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")

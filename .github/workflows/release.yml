@@ -29,7 +29,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "$GITHUB_REF_NAME"
-          data/release/pai_gp_scores.parquet
-          data/release/pai_gp_universe.parquet
+          data/release/pai_gp.parquet
           data/release/MANIFEST.json
           --verify-tag --generate-notes

@@ -41,10 +41,12 @@ from pai_common import (  # noqa: E402
     METADATA_CSV,
     SCORES_LONG_CSV,
     WIDE_THEME_FIELDS,
+    YEAR_CONFIGS,
 )
 from pai_contracts import (  # noqa: E402
     apply_reviewed_score_vector_links,
     apply_reviewed_theme_headers,
+    canonicalize_score_gp_codes,
     csv_to_typed_parquet,
     rows_to_typed_parquet,
     typed_schema,
@@ -125,6 +127,7 @@ def consolidate_analysis_tables(
                 apply_reviewed_score_vector_links(
                     tables["metadata"], tables["scores"], tables["wide"]
                 )
+                canonicalize_score_gp_codes(tables["metadata"], tables["scores"], tables["wide"])
                 apply_reviewed_theme_headers(tables["scores"], tables["wide"])
                 block_rel = block.rel.as_posix()
                 for name, rows in tables.items():
@@ -393,6 +396,9 @@ def main() -> None:
     parser.add_argument("--data-dir", default="data", help="Where the block store lives")
     parser.add_argument("--out", help="Where to write Parquet (default: --data-dir/derived)")
     parser.add_argument(
+        "--years", nargs="+", choices=list(YEAR_CONFIGS), help="limit the derived bundle"
+    )
+    parser.add_argument(
         "--expected-state-gps",
         action="append",
         default=[],
@@ -417,6 +423,7 @@ def main() -> None:
         data_dir,
         out,
         expected,
+        years=args.years,
         require_national=args.national_official_controls,
         universe_data_dir=Path(args.universe_data_dir) if args.universe_data_dir else None,
     )
