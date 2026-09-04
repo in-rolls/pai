@@ -18,7 +18,7 @@ whether or not the portal publishes its score.
 | `scorecard_url` | string | Official PAI scorecard path | null when `score_available` is false | PAI score table |
 | `overall_pai_score_score` | float64 | Overall PAI score on the portal's 0–100 scale | null when unscored | PAI score table |
 | `t1_poverty_free_and_enhanced_livelihoods_panchayat_score` | float64 | Theme 1 score on the portal's 0–100 scale | null when unscored | PAI score table |
-| `t2_healthy_panchayat_score` | float64 | Theme 2 score on the portal's 0–100 scale | null when unscored; plus 22 reviewed PAI 1.0 source blanks | PAI score table and archived HTML evidence |
+| `t2_healthy_panchayat_score` | float64 | Theme 2 score on the portal's 0–100 scale | null when unscored; plus 38 reviewed PAI 1.0 source blanks | PAI score table and archived HTML evidence |
 | `t3_child_friendly_panchayat_score` | float64 | Theme 3 score on the portal's 0–100 scale | null when unscored | PAI score table |
 | `t4_water_sufficient_panchayat_score` | float64 | Theme 4 score on the portal's 0–100 scale | null when unscored | PAI score table |
 | `t5_clean_and_green_panchayat_score` | float64 | Theme 5 score on the portal's 0–100 scale | null when unscored | PAI score table |

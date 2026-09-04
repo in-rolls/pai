@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """Compact the PAI data directory, and expand it again.
 
-The scraper's output is 6.8 GB in 79,815 files across 28,795 directories, none of
-it compressed. Almost all of that is recoverable without losing anything:
+The scraper's live tree is tens of thousands of small files. Almost all of that
+is recoverable without losing anything:
 
-  data/gp_scores_long.csv   1.99 GB  derived from the per-block files; regenerable
-  data/gp_metadata.csv       161 MB  likewise
-  per-block csv+json        2.35 GB  ->  56 MB as one solid zstd archive (42x)
-  html page captures        2.20 GB  ->  ~250 MB likewise
-  block_manifest.csv          49 MB  ->  2.9 MB parquet   (primary, kept)
-  dropdown_inventory.csv      10 MB  ->  0.5 MB parquet   (primary, kept)
+  per-block parquet+json    ->  one solid zstd archive (the JSON near-duplicates
+                                compress across files)
+  html page captures        ->  likewise, ~9x
+  block_manifest.csv        ->  parquet   (primary, kept)
+  dropdown_inventory.csv    ->  parquet   (primary, kept)
 
 Subcommands:
-  verify   Prove the global CSVs are reproducible from the per-block files.
-  compact  Archive the tree and drop what verify proved redundant.
+  verify   Check archives against their manifests and re-run every block contract.
+  compact  Archive the tree and remove it once every member checksum matches.
   expand   Restore a byte-identical tree (needed to resume a scrape).
   status   Report what form each year is in, and what it costs.
 
@@ -44,12 +43,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pai_common import (  # noqa: E402
-    DATA_WIDE_CSV,
-    METADATA_CSV,
-    SCORES_LONG_CSV,
-    consolidate_per_block,
-)
+from pai_common import BLOCK_TABLES  # noqa: E402
 from pai_contracts import (  # noqa: E402
     apply_reviewed_score_vector_links,
     apply_reviewed_theme_headers,
@@ -67,12 +61,6 @@ from pai_stores import (  # noqa: E402
     zstd_write_options,
 )
 
-# Rebuilt from the per-block tree by pai_rebuild_index.py, so they are copies, not
-# sources. Everything else at the top level is an append-only scrape log and stays.
-DERIVED_GLOBALS = {
-    "gp_scores_long.csv": SCORES_LONG_CSV,
-    "gp_metadata.csv": METADATA_CSV,
-}
 # Primary top-level CSVs: not reproducible from the per-block files, so they are
 # converted rather than dropped.
 PRIMARY_GLOBALS = ["block_manifest.csv", "dropdown_inventory.csv"]
@@ -88,35 +76,19 @@ def human(n: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# verify: are the global CSVs really reproducible from the per-block files?
+# verify: archives match their manifests, and every block still meets the contract
 # --------------------------------------------------------------------------- #
-def csv_row_multiset(path: Path) -> tuple[list[str], dict[tuple, int]]:
-    """Header plus a multiset of rows, so order and duplicates both stay visible."""
-    counts: dict[tuple, int] = {}
-    with path.open(newline="", encoding="utf-8") as f:
-        reader = csv.reader(f)
-        header = next(reader, [])
-        for row in reader:
-            key = tuple(row)
-            counts[key] = counts.get(key, 0) + 1
-    return header, counts
-
-
-def verify_rollup(data_dir: Path) -> int:
-    """Regenerate each derived global and compare it to the one on disk.
-
-    Compares row multisets, not bytes: consolidate_per_block walks rglob order,
-    which is not guaranteed stable across filesystems, so a pure diff would report
-    a difference that does not exist.
-    """
+def verify_rollup(data_dir: Path, years: list[str] | None = None) -> int:
+    """Check archive integrity, then re-run every block contract through the store."""
     failures = 0
     store = BlockStore(data_dir)
+    selected_years = years or store.years()
     score_exceptions = load_score_value_exceptions()
     allowed_null_scores = set(score_exceptions)
 
     # A compacted source tree is only trustworthy if every byte still matches
     # the manifest written before the live tree was removed.
-    for year in store.years():
+    for year in selected_years:
         if store.mode(year) != "archive":
             continue
         print(f"\n=== compact archive {year} ===")
@@ -142,65 +114,38 @@ def verify_rollup(data_dir: Path) -> int:
         else:
             print(f"  PASS {len(seen):,} archived members match the compact manifest")
 
-    for global_name, block_name in DERIVED_GLOBALS.items():
-        existing = data_dir / global_name
-        print(f"\n=== {global_name} ===")
-        if not existing.exists():
-            with tempfile.TemporaryDirectory() as td:
-                regen = Path(td) / global_name
-                n = consolidate_per_block(data_dir, block_name, regen)
-            if n == 0:
-                print("  FAIL absent global could not be rebuilt from the block store")
-                failures += 1
-            else:
-                print(f"  PASS absent global is rebuildable: {n:,} rows")
-            continue
-        with tempfile.TemporaryDirectory() as td:
-            regen = Path(td) / global_name
-            t0 = time.time()
-            n = consolidate_per_block(data_dir, block_name, regen)
-            print(f"  regenerated from per-block files: {n:,} rows ({time.time() - t0:.0f}s)")
-
-            head_a, rows_a = csv_row_multiset(existing)
-            head_b, rows_b = csv_row_multiset(regen)
-
-        if head_a != head_b:
-            print(f"  FAIL header differs\n    on disk:    {head_a}\n    regenerated: {head_b}")
-            failures += 1
-            continue
-
-        only_disk = sum(c for k, c in rows_a.items() if rows_b.get(k, 0) < c)
-        only_regen = sum(c for k, c in rows_b.items() if rows_a.get(k, 0) < c)
-        print(f"  rows on disk:      {sum(rows_a.values()):,}")
-        print(f"  rows regenerated:  {sum(rows_b.values()):,}")
-        print(f"  rows only on disk (would be LOST if deleted): {only_disk:,}")
-        print(f"  rows only regenerated (extra):                {only_regen:,}")
-        if only_disk or only_regen:
-            print("  FAIL not reproducible; do not delete this file")
-            failures += 1
-            for k in list(rows_a):
-                if rows_b.get(k, 0) < rows_a[k]:
-                    print(f"    example row present only on disk: {k[:6]} ...")
-                    break
-        else:
-            print("  PASS reproducible; safe to drop")
     # Stream block-sized batches rather than materializing the multi-GB global
     # long table. This still exercises the exact BlockStore read path and every
     # row contract, while a global key set catches duplicates across blocks.
+    print("\n=== unresolved blocks ===")
+    failed_blocks = [
+        f"{year}: {block.rel}"
+        for year in selected_years
+        for block in store.iter_blocks(year, names={"FAILED.json"})
+        if block.exists("FAILED.json")
+    ]
+    if failed_blocks:
+        print(f"  FAIL {len(failed_blocks):,} block(s) still carry FAILED.json; resolve them first")
+        for item in failed_blocks[:5]:
+            print(f"    {item}")
+        failures += 1
+    else:
+        print("  PASS no FAILED.json in the selected years")
+
     print("\n=== rebuilt analysis contract ===")
     seen_gp: set[tuple[str, ...]] = set()
     observed_null_scores: set[tuple[str, str, str]] = set()
     gp_rows = score_rows = wide_rows = done_blocks = repaired_identities = 0
     try:
-        names = {"DONE.json", METADATA_CSV, SCORES_LONG_CSV, DATA_WIDE_CSV}
-        for year in store.years():
+        names = {"DONE.json", *BLOCK_TABLES.values()}
+        for year in selected_years:
             for block in store.iter_blocks(year, names=names):
                 status = block.json("DONE.json")
                 if not status or status.get("status") != "done":
                     continue
-                metadata = block.rows(METADATA_CSV)
-                scores = block.rows(SCORES_LONG_CSV)
-                wide = block.rows(DATA_WIDE_CSV)
+                metadata = block.rows(BLOCK_TABLES["metadata"])
+                scores = block.rows(BLOCK_TABLES["scores"])
+                wide = block.rows(BLOCK_TABLES["wide"])
                 repaired_identities += apply_reviewed_score_vector_links(metadata, scores, wide)
                 apply_reviewed_theme_headers(scores, wide)
                 contract = validate_block_rows(
@@ -238,7 +183,9 @@ def verify_rollup(data_dir: Path) -> int:
             exception = score_exceptions[key]
             source_path = exception["source_path"]
             year = exception["year"]
-            manifest = store.read_manifest(year)
+            # A stale compact manifest can sit beside a re-expanded live tree; only
+            # an archived year is described by its manifest.
+            manifest = store.read_manifest(year) if store.mode(year) == "archive" else None
             expected_sha = exception["source_sha256"]
             if manifest is not None:
                 source_meta = manifest["files"].get(source_path)
@@ -277,7 +224,7 @@ def collect(year_dir: Path, data_dir: Path, keep_debug: bool) -> tuple[list, lis
     """
     data_files, html_files, dropped = [], [], []
     for root, dirs, files in os.walk(year_dir):
-        in_excluded = Path(root).name in EXCLUDED_DIRS
+        in_excluded = any(part in EXCLUDED_DIRS for part in Path(root).relative_to(year_dir).parts)
         dirs[:] = sorted(dirs)
         for fn in sorted(files):
             fp = Path(root) / fn
@@ -316,42 +263,54 @@ def archive_digests(path: Path) -> dict[str, str]:
 
 
 def to_parquet(src: Path, dst: Path) -> tuple[int, int]:
-    """Convert a CSV to parquet, reading every column as a string.
+    """Fold a CSV log into parquet, every column a string, appending to prior history.
 
     Type inference is the one way this step could silently change the data — a
     gp_code losing a leading zero, a grade of "NA" becoming null. The scraper
-    writes strings, so strings is what round-trips.
+    writes strings, so strings is what round-trips. The log is append-only, so an
+    existing parquet (from the last compaction) is history that must be kept.
     """
     import pyarrow as pa
-    import pyarrow.csv as pv
     import pyarrow.parquet as pq
 
     with src.open(newline="", encoding="utf-8") as f:
         header = next(csv.reader(f), [])
     if not header:
         raise SystemExit(f"{src}: no header row; refusing to convert an empty file")
-    table = pv.read_csv(
-        src,
-        read_options=pv.ReadOptions(block_size=1 << 26),
-        convert_options=pv.ConvertOptions(column_types=dict.fromkeys(header, pa.string())),
+    # Exact duplicate rows can only come from re-ingesting a CSV segment that an
+    # interrupted earlier fold had already written into the Parquet history:
+    # every log row carries its run_id and timestamp, so identical rows are never
+    # two events.
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    combined = []
+    for row in read_global(src.parent, src.stem):
+        key = tuple(sorted(row.items()))
+        if key in seen:
+            continue
+        seen.add(key)
+        combined.append(row)
+    fields = list(dict.fromkeys([*header, *(k for row in combined for k in row)]))
+    table = pa.Table.from_pylist(
+        [{k: row.get(k, "") for k in fields} for row in combined],
+        schema=pa.schema([pa.field(k, pa.string()) for k in fields]),
     )
-    pq.write_table(table, dst, compression="zstd", compression_level=3)
+    tmp = dst.with_suffix(".parquet.tmp")
+    pq.write_table(table, tmp, compression="zstd", compression_level=3)
 
-    # Read the parquet back and compare it cell-for-cell against the CSV before
-    # the caller deletes the CSV. Writing a file is not evidence that it holds
-    # what the source held.
-    with src.open(newline="", encoding="utf-8") as f:
-        original = list(csv.DictReader(f))
-    restored = read_global(src.parent, src.stem)
-    if len(original) != len(restored):
+    # Read the parquet back and compare it cell-for-cell against the source rows
+    # before the caller deletes the CSV. Writing a file is not evidence that it
+    # holds what the source held.
+    restored = pq.read_table(tmp).to_pylist()
+    if len(combined) != len(restored):
         raise SystemExit(
-            f"{src.name}: parquet has {len(restored):,} rows, CSV had {len(original):,}"
+            f"{src.name}: parquet has {len(restored):,} rows, sources had {len(combined):,}"
         )
-    for i, (a, b) in enumerate(zip(original, restored, strict=True)):
-        if a != b:
-            bad = [k for k in a if a[k] != b.get(k)]
+    for i, (a, b) in enumerate(zip(combined, restored, strict=True)):
+        if any(a.get(k, "") != (b.get(k) or "") for k in fields):
+            bad = [k for k in fields if a.get(k, "") != (b.get(k) or "")]
             raise SystemExit(f"{src.name}: row {i} differs in columns {bad}")
-    return table.num_rows, len(header)
+    tmp.replace(dst)
+    return table.num_rows, len(fields)
 
 
 def compact_year(store: BlockStore, year: str, keep_debug: bool) -> bool:
@@ -416,6 +375,11 @@ def compact_year(store: BlockStore, year: str, keep_debug: bool) -> bool:
         f"({data_bytes / max(blocks_archive.stat().st_size, 1):.0f}x, {time.time() - t0:.0f}s)"
     )
 
+    if not html_files and html_archive.exists():
+        # A tree recompacted without captures must not keep an archive the new
+        # manifest does not describe: verify would fail and expand would resurrect it.
+        html_archive.unlink()
+        print(f"  removed obsolete {html_archive.name} (no captures in the tree)")
     if html_files:
         t0 = time.time()
         print(f"  writing {html_archive.name} ...")
@@ -448,20 +412,24 @@ def compact_year(store: BlockStore, year: str, keep_debug: bool) -> bool:
     store.manifest_path(year).write_text(json.dumps(manifest, indent=1), encoding="utf-8")
     print(f"  wrote {store.manifest_path(year).name}")
 
-    shutil.rmtree(year_dir)
+    retire_dir(year_dir)
     print(f"  removed {year_dir}/ ({human(data_bytes + html_bytes)} freed)")
     return True
 
 
+def retire_dir(path: Path) -> None:
+    """Rename a directory out of the store's namespace, then delete it.
+
+    An interrupted delete must never leave a partial live tree that
+    BlockStore.mode() would prefer over the verified archive.
+    """
+    retired = path.with_name(f".retired-{path.name}-{os.getpid()}")
+    path.rename(retired)
+    shutil.rmtree(retired)
+
+
 def compact_globals(data_dir: Path) -> None:
     print("\n=== top-level files ===")
-    for name in DERIVED_GLOBALS:
-        p = data_dir / name
-        if p.exists():
-            sz = p.stat().st_size
-            p.unlink()
-            print(f"  removed {name} ({human(sz)} freed; rebuild with pai_rebuild_index.py)")
-
     for name in PRIMARY_GLOBALS:
         src = data_dir / name
         if not src.exists():
@@ -477,7 +445,14 @@ def compact_globals(data_dir: Path) -> None:
 
     for log in sorted(data_dir.glob("*.log")):
         raw = log.read_bytes()
-        dst = log.with_suffix(".log.zst")
+        # One archive per compaction: a resumed collection writes a new live log,
+        # and folding it must not overwrite the history already compressed.
+        stamp = time.strftime("%Y%m%d_%H%M%S", time.gmtime())
+        dst = log.with_name(f"{log.stem}.{stamp}.log.zst")
+        serial = 1
+        while dst.exists():
+            dst = log.with_name(f"{log.stem}.{stamp}.{serial}.log.zst")
+            serial += 1
         with ZstdFile(dst, "wb", options=zstd_write_options()) as f:
             f.write(raw)
         log.unlink()
@@ -492,33 +467,50 @@ def expand_year(store: BlockStore, year: str, into: Path) -> bool:
     if manifest is None:
         print(f"  [{year}] no manifest; cannot verify an expansion")
         return False
+    if (into / year).exists():
+        # A live tree may hold blocks scraped after the archive was written;
+        # extracting over it would silently revert them.
+        print(f"  [{year}] {into / year} already exists; refusing to expand over a live tree")
+        return False
     into.mkdir(parents=True, exist_ok=True)
-    n = 0
-    for archive in (store.archive_path(year), store.html_archive_path(year)):
-        if not archive.exists():
-            continue
-        print(f"  extracting {archive.name} ...")
-        with ZstdFile(archive, "rb", options=zstd_read_options()) as zf:
-            with tarfile.open(fileobj=zf, mode="r|") as tar:
-                tar.extractall(into, filter="data")
-                n += 1
-    if not n:
-        print(f"  [{year}] no archives found")
-        return False
+    # Extract into a staging directory so a failed or partial expansion never
+    # leaves a half-built live tree that readers would prefer over the archive.
+    staging = Path(tempfile.mkdtemp(prefix=f".expand-{year}-", dir=into))
+    try:
+        n = 0
+        for archive in (store.archive_path(year), store.html_archive_path(year)):
+            if not archive.exists():
+                continue
+            print(f"  extracting {archive.name} ...")
+            with ZstdFile(archive, "rb", options=zstd_read_options()) as zf:
+                with tarfile.open(fileobj=zf, mode="r|") as tar:
+                    tar.extractall(staging, filter="data")
+                    n += 1
+        if not n:
+            print(f"  [{year}] no archives found")
+            return False
 
-    print("  verifying against the manifest ...")
-    bad = []
-    for arc, meta in manifest["files"].items():
-        fp = into / arc
-        if not fp.exists():
-            bad.append(("missing", arc))
-        elif sha256_bytes(fp.read_bytes()) != meta["sha256"]:
-            bad.append(("checksum", arc))
-    if bad:
-        print(f"  FAIL {len(bad)} file(s) differ")
-        for kind, arc in bad[:5]:
-            print(f"    {kind}: {arc}")
-        return False
+        print("  verifying against the manifest ...")
+        bad = []
+        for arc, meta in manifest["files"].items():
+            fp = staging / arc
+            if not fp.exists():
+                bad.append(("missing", arc))
+            elif sha256_bytes(fp.read_bytes()) != meta["sha256"]:
+                bad.append(("checksum", arc))
+        # An archive member the manifest never described is an unverified block;
+        # it must not be promoted into a tree that readers trust.
+        extracted = {p.relative_to(staging).as_posix() for p in staging.rglob("*") if p.is_file()}
+        for arc in sorted(extracted - set(manifest["files"])):
+            bad.append(("unexpected", arc))
+        if bad:
+            print(f"  FAIL {len(bad)} file(s) differ; nothing was placed under {into / year}")
+            for kind, arc in bad[:5]:
+                print(f"    {kind}: {arc}")
+            return False
+        (staging / year).rename(into / year)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     print(f"  PASS {len(manifest['files']):,} files restored byte-identical to {into}")
     return True
 
@@ -578,8 +570,8 @@ def main() -> int:
         return cmd_status(store)
 
     if args.command == "verify":
-        failures = verify_rollup(data_dir)
-        print(f"\n{'FAILED' if failures else 'PASS'}: {failures} global(s) not reproducible")
+        failures = verify_rollup(data_dir, args.years)
+        print(f"\n{'FAILED' if failures else 'PASS'}: {failures} check(s) failed")
         return 1 if failures else 0
 
     if args.command == "expand":
@@ -588,15 +580,18 @@ def main() -> int:
         return 0 if ok else 1
 
     # compact
-    print("Gate: the derived globals must be reproducible before anything is removed.")
-    if verify_rollup(data_dir) != 0:
+    print("Gate: every block must pass the contract before anything is removed.")
+    if verify_rollup(data_dir, years) != 0:
         print("\nABORT: verify failed; nothing was changed.", file=sys.stderr)
         return 1
     for year in years:
         if not compact_year(store, year, args.keep_debug):
             print("\nABORT: archive verification failed; nothing was deleted.", file=sys.stderr)
             return 1
-    compact_globals(data_dir)
+    # The top-level logs are shared by every year; fold them only when the whole
+    # collection is being put away, never under a scraper that is still appending.
+    if not args.years:
+        compact_globals(data_dir)
     print()
     return cmd_status(store)
 

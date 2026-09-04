@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from pathlib import Path
 
 import pai_common as c
 import pai_contracts
@@ -10,7 +11,6 @@ import pai_scraper_resumable as scraper
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from build_release import requires_national_controls
 
 
 def make_rows(n=2):
@@ -79,12 +79,6 @@ def test_official_pai2_controls_cover_33_states_and_reconcile():
     assert sum(states.values()) == controls["__india__"] == 259_867
 
 
-def test_pai2_release_requires_national_controls_by_default():
-    assert requires_national_controls("2023-2024", allow_partial=False)
-    assert not requires_national_controls("2023-2024", allow_partial=True)
-    assert not requires_national_controls("2022-2023", allow_partial=False)
-
-
 def test_block_contract_accepts_ten_unique_themes():
     metadata, scores, wide = make_rows()
     assert pai_contracts.validate_block_rows(metadata, scores, wide) == {
@@ -117,14 +111,13 @@ def test_block_contract_rejects_corruption(failure):
 
 
 def test_typed_parquet_preserves_ids_and_types(tmp_path):
-    src = tmp_path / "scores.csv"
-    c.write_csv_rows(
-        src,
+    dst = tmp_path / "scores.parquet"
+    pai_contracts.rows_to_typed_parquet(
         [{"gp_code": "007", "theme_order": "0", "score": "51.25"}],
         ["gp_code", "theme_order", "score"],
+        dst,
+        "scores",
     )
-    dst = tmp_path / "scores.parquet"
-    pai_contracts.csv_to_typed_parquet(src, dst, "scores")
     table = pq.read_table(dst)
     assert table.schema == pa.schema(
         [
@@ -136,17 +129,26 @@ def test_typed_parquet_preserves_ids_and_types(tmp_path):
     assert table.to_pylist() == [{"gp_code": "007", "theme_order": 0, "score": 51.25}]
 
 
-def test_csv_to_parquet_streams_multiple_batches(tmp_path):
-    src = tmp_path / "scores.csv"
-    rows = [
-        {"gp_code": f"{i:06d}", "theme_order": str(i % 10), "score": "51.25"} for i in range(500)
-    ]
-    c.write_csv_rows(src, rows, ["gp_code", "theme_order", "score"])
-    dst = tmp_path / "scores.parquet"
-    pai_contracts.csv_to_typed_parquet(src, dst, "scores", block_size=256)
-    parquet = pq.ParquetFile(dst)
-    assert parquet.metadata.num_rows == 500
-    assert parquet.metadata.num_row_groups > 1
+def test_typed_table_rejects_non_numeric_score():
+    with pytest.raises(AssertionError, match="score is not double: 'abc'"):
+        pai_contracts.rows_to_table(
+            [{"gp_code": "1", "theme_order": "0", "score": "abc"}],
+            ["gp_code", "theme_order", "score"],
+            "scores",
+        )
+
+
+def test_block_tables_have_fixed_typed_schemas(tmp_path):
+    metadata, scores, wide = make_rows(1)
+    written = pai_contracts.write_block_tables(tmp_path, metadata, scores, wide)
+    for kind, path in written.items():
+        assert path.name == c.BLOCK_TABLES[kind]
+        assert pq.read_schema(path) == pai_contracts.typed_schema(
+            list(c.BLOCK_TABLE_FIELDS[kind]), kind
+        )
+    wide_schema = pq.read_schema(written["wide"])
+    assert wide_schema.field(c.OVERALL_COL).type == pa.float64()
+    assert wide_schema.field("gp_code").type == pa.string()
 
 
 def test_expected_count_parser():
@@ -237,6 +239,8 @@ def test_ambiguous_gp_name_requires_reviewed_link():
 
 def test_handler_name_suffix_is_removed_and_must_match_code():
     assert scraper.clean_universe_gp_name("272000", "Adhiyarawa [272000]") == "Adhiyarawa"
+    assert scraper.clean_universe_gp_name("97946", "Paroo [N] [97946]") == "Paroo [N]"
+    assert scraper.clean_universe_gp_name("97855", "Bariyarpur[East] [97855]") == "Bariyarpur[East]"
     with pytest.raises(AssertionError, match="disagrees"):
         scraper.clean_universe_gp_name("272000", "Adhiyarawa [999999]")
 
@@ -265,7 +269,7 @@ def test_only_exact_reviewed_source_blank_score_is_allowed():
 
 def test_repository_score_null_exceptions_are_evidenced_and_exact():
     exceptions = pai_contracts.load_score_value_exceptions()
-    assert len(exceptions) == 22
+    assert len(exceptions) == 38
     assert {key[2] for key in exceptions} == {"t2_healthy_panchayat"}
     assert all(row["source_path"].endswith("/html/page_001.html") for row in exceptions.values())
 
@@ -437,9 +441,7 @@ def test_rebuild_promotes_only_complete_valid_bundle_and_manifest_is_portable(tm
     block = tmp_path / "2023-2024" / "UP__9" / "D__1" / "B__2"
     block.mkdir(parents=True)
     metadata, scores, wide = make_rows(1)
-    c.write_csv_rows(block / c.METADATA_CSV, metadata, c.GP_METADATA_FIELDS)
-    c.write_csv_rows(block / c.SCORES_LONG_CSV, scores, c.GP_SCORE_FIELDS)
-    c.write_csv_rows(block / c.DATA_WIDE_CSV, wide)
+    pai_contracts.write_block_tables(block, metadata, scores, wide)
     c.write_json(
         block / c.DONE_JSON,
         {"status": "done", "gp_rows": 1, "score_rows": 10, "state": "Uttar Pradesh"},
@@ -468,3 +470,297 @@ def test_rebuild_promotes_only_complete_valid_bundle_and_manifest_is_portable(tm
             years=["2023-2024"],
         )
     assert manifest_path.read_bytes() == before
+
+
+def test_officially_unscored_state_allows_whole_block_no_data():
+    universe = {"1": "A", "2": "B"}
+    exc = scraper.officially_unscored_state_exception("2023-2024", "West Bengal", universe)
+    assert exc["allowed_missing_gp_codes"] == {"1", "2"}
+    assert "PressRelease" in exc["evidence"]
+    assert scraper.validate_gp_universe(set(), set(universe), exc)["status"]
+    assert scraper.officially_unscored_state_exception("2023-2024", "Bihar", universe) is None
+    assert scraper.officially_unscored_state_exception("2021-2022", "West Bengal", universe) is None
+    for state in ("West Bengal", "Meghalaya", "Nagaland", "Goa", "Puducherry"):
+        assert scraper.officially_unscored_state_exception("2022-2023", state, universe)
+
+
+def test_same_name_gps_keep_their_own_codes():
+    universe = {"132753": "Pondi", "132189": "Pondi", "1": "Amba"}
+    meta = [
+        {"gp_name": "Pondi", "gp_code": "132753"},
+        {"gp_name": "Pondi", "gp_code": "132189"},
+        {"gp_name": "Amba", "gp_code": ""},
+    ]
+    scores = [dict(m) for m in meta]
+    wide = [dict(m) for m in meta]
+    scraper.link_missing_gp_codes(meta, scores, wide, universe)
+    assert [m["gp_code"] for m in meta] == ["132753", "132189", "1"]
+    assert [m["gp_code"] for m in scores] == ["132753", "132189", "1"]
+    with pytest.raises(AssertionError, match="2 exact universe matches"):
+        scraper.link_missing_gp_codes([{"gp_name": "Pondi", "gp_code": ""}], [], [], universe)
+
+
+def test_partially_scored_state_accepts_subset_but_never_extra_codes(tmp_path):
+    manifest = tmp_path / "collection_manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "counts_by_state": {
+                    "2023-2024:17": {"hierarchy_gp_rows": 6859, "published_scored_gp_count": 3069},
+                    "2023-2024:22": {
+                        "hierarchy_gp_rows": 11643,
+                        "published_scored_gp_count": 11643,
+                    },
+                    "2022-2023:17": {"hierarchy_gp_rows": 6859, "published_scored_gp_count": -1},
+                }
+            }
+        )
+    )
+    assert scraper.load_partially_scored_states(manifest) == {("2023-2024", "17")}
+    assert scraper.load_partially_scored_states(None) == set()
+
+    check = scraper.validate_gp_universe({"1"}, {"1", "2"}, allow_subset=True)
+    assert check["status"] == "subset_in_partially_scored_state"
+    assert check["missing"] == {"2"}
+    with pytest.raises(AssertionError, match="empty score result"):
+        scraper.validate_gp_universe(set(), {"1", "2"}, allow_subset=True)
+    assert scraper.validate_gp_universe({"1", "2"}, {"1", "2"}, allow_subset=True)["status"] == (
+        "exact_universe_match"
+    )
+    with pytest.raises(AssertionError, match="absent from"):
+        scraper.validate_gp_universe({"1", "9"}, {"1", "2"}, allow_subset=True)
+
+
+def test_zero_score_is_a_score_not_a_blank():
+    assert pai_contracts._canonical_score(0.0) == "0"
+    assert pai_contracts._canonical_score(0) == "0"
+    assert pai_contracts._canonical_score("0.00") == "0"
+    assert pai_contracts._canonical_score(None) == ""
+    assert pai_contracts._canonical_score("") == ""
+
+
+def test_block_contract_rejects_blank_identity_fields():
+    metadata, scores, wide = make_rows(1)
+    for rows in (metadata, scores, wide):
+        for row in rows:
+            row["state"] = ""
+    with pytest.raises(AssertionError, match="blank identity"):
+        pai_contracts.validate_block_rows(metadata, scores, wide)
+
+
+def test_universe_from_store_refuses_a_finished_block_without_its_cache(tmp_path):
+    block = tmp_path / "2023-2024" / "UP__9" / "D__1" / "B__2"
+    block.mkdir(parents=True)
+    c.write_json(block / c.DONE_JSON, {"status": "done_no_data_available", "gp_rows": 0})
+    with pytest.raises(AssertionError, match="lack their universe cache"):
+        pai_rebuild_index.write_universe_from_store(
+            tmp_path, tmp_path / "universe.parquet", ["2023-2024"]
+        )
+
+
+def test_current_identity_contract_covers_every_vintage_after_pai_1():
+    metadata, scores, wide = make_rows(1)
+    for rows in (metadata, scores, wide):
+        for row in rows:
+            row["year"] = "2024-2025"
+            row["gp_code"] = ""
+            row["scorecard_url"] = ""
+    with pytest.raises(AssertionError, match="LGD code"):
+        pai_contracts.validate_block_rows(metadata, scores, wide)
+
+
+def test_national_controls_require_the_independent_universe(tmp_path):
+    with pytest.raises(AssertionError, match="requires --universe-data-dir"):
+        pai_rebuild_index.build(tmp_path, tmp_path / "derived", {}, require_national=True)
+
+
+def test_store_universe_rows_carry_the_exact_request_url(tmp_path):
+    block = tmp_path / "2023-2024" / "UP__9" / "D__1" / "B__2"
+    block.mkdir(parents=True)
+    c.write_json(block / c.DONE_JSON, {"status": "done", "gp_rows": 1})
+    _write_universe_source(tmp_path)
+    provenance = block / "source" / "gp_universe_provenance.json"
+    prov = json.loads(provenance.read_text())
+    prov["params"] = {"SID": "9", "ZID": "1", "BID": "2", "YID": "2"}
+    provenance.write_text(json.dumps(prov))
+    out = tmp_path / "universe.parquet"
+    pai_rebuild_index.write_universe_from_store(tmp_path, out, ["2023-2024"])
+    url = pq.read_table(out).column("source_url")[0].as_py()
+    assert url == f"{scraper.GP_UNIVERSE_URL}?BID=2&SID=9&YID=2&ZID=1"
+
+
+def test_official_controls_are_internally_consistent():
+    for year, controls in c.OFFICIAL_FINAL_GP_COUNTS.items():
+        states = {k: v for k, v in controls.items() if not k.startswith("__")}
+        assert sum(states.values()) == controls["__india__"], year
+        assert year in c.OFFICIAL_FINAL_GP_COUNTS_SOURCE
+    assert c.OFFICIAL_FINAL_GP_COUNTS["2022-2023"]["__india__"] == 216_285
+    assert len(c.OFFICIAL_FINAL_GP_COUNTS["2022-2023"]) - 1 == 29
+    assert c.OFFICIAL_FINAL_GP_COUNTS["2023-2024"]["__india__"] == 259_867
+
+
+def test_officially_unvalidated_state_is_only_one_absent_from_a_controlled_vintage():
+    assert scraper.officially_unvalidated_state("2022-2023", "Meghalaya")
+    assert not scraper.officially_unvalidated_state("2022-2023", "Uttar Pradesh")
+    assert not scraper.officially_unvalidated_state("2023-2024", "Meghalaya")
+    assert not scraper.officially_unvalidated_state("2021-2022", "Meghalaya")
+
+
+def test_reviewed_official_count_exception_requires_the_portal_count(tmp_path):
+    ledger = tmp_path / "official_count_exceptions.csv"
+    ledger.write_text(
+        "year,state,official_count,portal_count,evidence\n"
+        "2022-2023,Assam,2183,2154,portal displays 2154 in two independent double retrievals\n"
+    )
+    exceptions = pai_contracts.load_official_count_exceptions(ledger)
+    controls = {"Assam": 2183, "__india__": 2183}
+    assert pai_contracts.expected_state_count("2022-2023", "Assam", controls, exceptions)[0] == 2154
+    assert pai_contracts.expected_state_count("2022-2023", "Assam", controls, {})[0] == 2183
+    ledger.write_text(
+        "year,state,official_count,portal_count,evidence\n2022-2023,Assam,2183,2154,\n"
+    )
+    with pytest.raises(ValueError, match="requires evidence"):
+        pai_contracts.load_official_count_exceptions(ledger)
+
+
+def test_repository_official_count_exceptions_are_consistent_with_controls():
+    for (year, state), row in pai_contracts.load_official_count_exceptions().items():
+        assert c.OFFICIAL_FINAL_GP_COUNTS[year][state] == row["official_count"], (year, state)
+
+
+def test_missing_hierarchy_manifest_means_strict_contract(tmp_path):
+    assert scraper.load_partially_scored_states(tmp_path / "absent.json") == set()
+
+
+def test_partial_state_subset_may_not_be_empty():
+    with pytest.raises(AssertionError, match="empty score result"):
+        scraper.validate_gp_universe(set(), {"1", "2"}, allow_subset=True)
+    assert scraper.validate_gp_universe({"1"}, {"1", "2"}, allow_subset=True)["status"] == (
+        "subset_in_partially_scored_state"
+    )
+
+
+def test_alert_confirmed_no_data_is_a_valid_subset_but_a_blank_render_is_not():
+    check = scraper.validate_gp_universe(
+        set(), {"1", "2"}, allow_subset=True, no_data_confirmed=True
+    )
+    assert check["status"] == "subset_in_partially_scored_state"
+    with pytest.raises(AssertionError, match="empty score result"):
+        scraper.validate_gp_universe(set(), {"1", "2"}, allow_subset=True)
+    assert scraper.load_partially_scored_states(Path(".")) == set()
+
+
+def test_empty_hierarchy_manifest_file_means_strict_contract(tmp_path):
+    empty = tmp_path / "collection_manifest.json"
+    empty.write_bytes(b"")
+    assert scraper.load_partially_scored_states(empty) == set()
+
+
+def test_rebuild_regenerates_wide_scores_from_the_long_table(tmp_path):
+    """An interrupted block write can leave a stale wide table beside new long scores;
+    the rebuild must publish the long scores, never the stale wide ones."""
+    block = tmp_path / "2023-2024" / "UP__9" / "D__1" / "B__2"
+    block.mkdir(parents=True)
+    metadata, scores, wide = make_rows(1)
+    wide[0][c.OVERALL_COL] = "99"  # long table still says 50
+    pai_contracts.write_block_tables(block, metadata, scores, wide)
+    c.write_json(
+        block / c.DONE_JSON,
+        {"status": "done", "gp_rows": 1, "score_rows": 10, "state": "Uttar Pradesh"},
+    )
+    _write_universe_source(tmp_path)
+    out = tmp_path / "derived"
+    pai_rebuild_index.build(
+        out.parent, out, {("2023-2024", "Uttar Pradesh"): 1}, years=["2023-2024"]
+    )
+    wide_row = pq.read_table(out / "gp_scores_wide.parquet").to_pylist()[0]
+    long_rows = pq.read_table(out / "gp_scores_long.parquet").to_pylist()
+    overall = next(r["score"] for r in long_rows if r["theme_slug"] == c.OVERALL_SLUG)
+    assert wide_row[c.OVERALL_COL] == overall == 50.0
+
+
+def _universe_dir(root, rows):
+    universe = root / "universe"
+    universe.mkdir()
+    table = pa.Table.from_pylist(
+        rows, schema=pai_contracts.typed_schema(c.GP_UNIVERSE_FIELDS, "universe")
+    )
+    pq.write_table(table, universe / "gp_universe.parquet")
+    counts = {}
+    for row in rows:
+        counts.setdefault(row["year"], {"parquet_rows": 0})["parquet_rows"] += 1
+    manifest = {
+        "parquet": {
+            "sha256": hashlib.sha256((universe / "gp_universe.parquet").read_bytes()).hexdigest()
+        },
+        "row_count": len(rows),
+        "counts_by_year": counts,
+    }
+    (universe / "collection_manifest.json").write_text(json.dumps(manifest))
+    return universe
+
+
+def test_standalone_universe_must_match_its_collection_manifest(tmp_path):
+    row = {
+        "year": "2023-2024",
+        "state": "Uttar Pradesh",
+        "state_value": "9",
+        "district": "D",
+        "district_value": "1",
+        "block": "B",
+        "block_value": "2",
+        "gp_code": "100",
+        "gp_name": "GP 0",
+        "source_url": "u",
+        "retrieved_utc": "t",
+        "source_sha256": "a" * 64,
+    }
+    universe = _universe_dir(tmp_path, [row])
+    assert (
+        pai_rebuild_index.verify_universe_source(universe, ["2023-2024"])["universe_source_rows"]
+        == 1
+    )
+    with pytest.raises(AssertionError, match="no universe collection for 2022-2023"):
+        pai_rebuild_index.verify_universe_source(universe, ["2022-2023"])
+    # A shortened Parquet (one unscored GP lost) no longer matches the manifest.
+    pq.write_table(
+        pq.read_table(universe / "gp_universe.parquet").slice(0, 0),
+        universe / "gp_universe.parquet",
+    )
+    with pytest.raises(AssertionError, match="checksum differs"):
+        pai_rebuild_index.verify_universe_source(universe, ["2023-2024"])
+
+
+def test_universe_rows_skip_the_null_sentinel_but_reject_other_nulls():
+    payload = {"columns": ["gp_code", "nm"], "rows": [[1, "A [1]"], [None, None]]}
+    assert scraper.universe_rows(payload) == [("1", "A [1]")]
+    with pytest.raises(RuntimeError, match="malformed row"):
+        scraper.universe_rows({"rows": [[1, None]]})
+
+
+def test_universe_payload_with_sentinel_is_not_a_duplicate():
+    payload = {"columns": ["gp_code", "nm"], "rows": [[1, "A [1]"], [None, None]]}
+    assert scraper.universe_from_payload(payload) == {"1": "A"}
+    with pytest.raises(RuntimeError, match="duplicate LGD codes"):
+        scraper.universe_from_payload(
+            {"columns": ["gp_code", "nm"], "rows": [[1, "A [1]"], [1, "A [1]"]]}
+        )
+
+
+def test_truncated_display_code_is_decoded_from_the_scorecard_url_before_linking():
+    url = "/PS/Public/SC.aspx?f_id=Mg==&s_id=OQ==&d_id=MQ==&b_id=Mg==&Blank=1&gp_id=MjcyMDAw"
+    universe = {"272000": "Amba", "272001": "Amba"}  # ambiguous by name
+    meta = [{"gp_name": "Amba", "gp_code": "27", "scorecard_url": url}]
+    rows = [dict(meta[0])]
+    with pytest.raises(AssertionError, match="2 exact universe matches"):
+        scraper.link_missing_gp_codes([dict(meta[0])], [], [], universe)
+    pai_contracts.canonicalize_score_gp_codes(meta, rows, rows)
+    scraper.link_missing_gp_codes(meta, rows, rows, universe)
+    assert meta[0]["gp_code"] == "272000"
+
+
+def test_a_universe_code_is_trusted_even_when_the_display_name_is_misspelled():
+    universe = {"272000": "Amba"}
+    meta = [{"gp_name": "Ambaa", "gp_code": "272000"}]
+    scraper.link_missing_gp_codes(meta, [], [], universe)
+    assert meta[0]["gp_code"] == "272000"

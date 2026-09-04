@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pai_common import (  # noqa: E402
+    BLOCK_TABLES,
     MANIFEST_FAILED,
     MANIFEST_NO_DATA,
     MANIFEST_SUCCESS,
@@ -26,12 +27,17 @@ def analyze_progress(rows: list[dict], year: str | None = None) -> dict:
     if year:
         rows = [r for r in rows if r["year"] == year]
 
-    # Track unique blocks by their directory path (most recent status wins)
+    # One logical block per hierarchy id (most recent status wins): the same block
+    # may appear under different output-root spellings across compacted history
+    # and the live log tail.
     block_status = {}
     for row in rows:
-        block_dir = row["block_dir"]
-        if block_dir:
-            block_status[block_dir] = row
+        if not row.get("block_dir"):
+            continue
+        key = tuple(
+            row.get(field, "") for field in ("year", "state_value", "district_value", "block_value")
+        )
+        block_status[key] = row
 
     # Categorize statuses (shared buckets; "skipped_*" mark resumable re-runs).
     success_statuses = MANIFEST_SUCCESS
@@ -130,12 +136,12 @@ def print_state_coverage(results: dict):
     print()
 
 
-def check_csvs_on_disk(data_dir: Path, year: str) -> int:
-    """Count blocks that actually hold a data_wide.csv, live or archived."""
+def check_tables_on_disk(data_dir: Path, year: str) -> int:
+    """Count blocks that actually hold a wide score table, live or archived."""
     store = BlockStore(data_dir)
     if store.mode(year) == "missing":
         return 0
-    return sum(1 for blk in store.iter_blocks(year, names={"data_wide.csv"}))
+    return sum(1 for blk in store.iter_blocks(year, names={BLOCK_TABLES["wide"]}))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -161,12 +167,12 @@ def main(argv: list[str] | None = None) -> int:
 
     print_summary(results, args.year)
 
-    csv_count = check_csvs_on_disk(data_dir, args.year)
-    print(f"CSVs on disk: {csv_count}")
-    if csv_count != len(results["successful"]):
+    table_count = check_tables_on_disk(data_dir, args.year)
+    print(f"Score tables on disk: {table_count}")
+    if table_count != len(results["successful"]):
         print(
             f"  Note: Manifest shows {len(results['successful'])} successful, "
-            f"disk has {csv_count} CSVs"
+            f"disk has {table_count} score tables"
         )
     print()
 

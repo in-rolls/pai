@@ -2,6 +2,7 @@
 
 import data_summary
 import pai_common as c
+import pai_contracts
 
 
 def make_block(year_dir, state, district, block, status, gp_rows=0, overalls=()):
@@ -18,8 +19,10 @@ def make_block(year_dir, state, district, block, status, gp_rows=0, overalls=())
         },
     )
     if overalls:
-        rows = [{"gp_name": f"gp{i}", c.OVERALL_COL: str(v)} for i, v in enumerate(overalls)]
-        c.write_csv_rows(bd / "data_wide.csv", rows, ["gp_name", c.OVERALL_COL])
+        rows = [{"gp_name": f"gp{i}", c.OVERALL_COL: v} for i, v in enumerate(overalls)]
+        pai_contracts.rows_to_typed_parquet(
+            rows, ["gp_name", c.OVERALL_COL], bd / "data_wide.parquet", "wide"
+        )
 
 
 def test_build_counts_and_mean(tmp_path):

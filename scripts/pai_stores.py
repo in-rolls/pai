@@ -1,10 +1,10 @@
 """Format-aware access to the per-block tree, live on disk or inside a zstd archive.
 
-The scraper writes one directory per block (``data_wide.csv``, ``metadata.csv``,
-``scores_long.csv``, ``context.json``, ``DONE.json``, plus ``html/``). That tree is
-the authoritative state but a wasteful way to keep it: 12,464 blocks are 2.35 GB
-loose and 56 MB as a single zstd archive, because the files are near-duplicates of
-each other and a solid archive can compress across them.
+The scraper writes one directory per block (``metadata.parquet``,
+``scores_long.parquet``, ``data_wide.parquet``, ``context.json``, ``DONE.json``, plus
+``html/``). That tree is the authoritative state but a wasteful way to keep it loose:
+the JSON files are near-duplicates of each other and a solid archive compresses
+across them.
 
 Consumers go through :class:`BlockStore` so they work either way. The scraper does
 not — it keeps writing the live tree, and compaction is a separate step over
@@ -28,9 +28,12 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 # Per-block payload lives in these; html/ and debug/ are archived separately so the
 # 2.2 GB of page captures never has to be touched to read a score.
-DATA_SUFFIXES = (".csv", ".json")
+DATA_SUFFIXES = (".parquet", ".json")
 HTML_SUFFIXES = (".html",)
 EXCLUDED_DIRS = ("html", "debug")
 
@@ -78,18 +81,15 @@ class Block:
         raw = self.text(name)
         return None if raw is None else json.loads(raw)
 
-    def rows(self, name: str) -> list[dict[str, str]]:
-        """Read a per-block CSV into dict rows; [] if the file is absent."""
-        raw = self.text(name)
-        if raw is None:
-            return []
-        return list(csv.DictReader(io.StringIO(raw, newline="")))
+    def table(self, name: str) -> pa.Table | None:
+        """Read a per-block Parquet table; None if the file is absent."""
+        raw = self.files.get(name)
+        return None if raw is None else pq.read_table(io.BytesIO(raw))
 
-    def header(self, name: str) -> list[str]:
-        raw = self.text(name)
-        if raw is None:
-            return []
-        return next(csv.reader(io.StringIO(raw, newline="")), [])
+    def rows(self, name: str) -> list[dict[str, Any]]:
+        """Read a per-block Parquet table into typed dict rows; [] if absent."""
+        table = self.table(name)
+        return [] if table is None else table.to_pylist()
 
     @property
     def data_bytes(self) -> int:
@@ -125,7 +125,11 @@ class BlockStore:
 
     def years(self) -> list[str]:
         """Every year present in either form, sorted."""
-        found = {p.name for p in self.data_dir.glob("*") if p.is_dir() and "-" in p.name}
+        found = {
+            p.name
+            for p in self.data_dir.glob("*")
+            if p.is_dir() and "-" in p.name and not p.name.startswith(".")
+        }
         for p in self.data_dir.glob("blocks_*.tar.zst"):
             found.add(p.name[len("blocks_") : -len(".tar.zst")])
         return sorted(found)
@@ -134,8 +138,8 @@ class BlockStore:
     def iter_blocks(self, year: str, names: set[str] | None = None) -> Iterator[Block]:
         """Yield each block of `year`. `names` limits which files are loaded.
 
-        A caller that only needs ``scores_long.csv`` should say so: on the live
-        tree that is the difference between reading 60 MB and reading 2.35 GB.
+        A caller that only needs ``DONE.json`` should say so: on the live tree
+        that is the difference between reading a few MB and the whole cache.
         """
         mode = self.mode(year)
         if mode == "live":
@@ -266,25 +270,39 @@ def sha256_bytes(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def read_global(data_dir: Path, stem: str) -> list[dict[str, str]]:
-    """Read a top-level table by stem name, from parquet if present, else CSV.
+# Column names the append-only logs carried before the per-block cache became Parquet.
+LEGACY_GLOBAL_COLUMNS = {
+    "metadata_csv": "metadata_file",
+    "scores_long_csv": "scores_file",
+    "data_wide_csv": "wide_file",
+}
 
-    Everything is returned as strings either way: the scraper writes strings, and
-    the parquet is written with a string schema so a gp_code cannot lose a leading
-    zero on the way through.
+
+def _rename_legacy(row: dict[str, str]) -> dict[str, str]:
+    return {LEGACY_GLOBAL_COLUMNS.get(name, name): value for name, value in row.items()}
+
+
+def read_global(data_dir: Path, stem: str) -> list[dict[str, str]]:
+    """Read a top-level append-only log: compacted Parquet first, then the live CSV.
+
+    After a compaction the scraper starts a fresh CSV, so the older rows live in the
+    Parquet and the newer ones in the CSV; the log is their concatenation. Everything
+    is returned as strings either way: the scraper writes strings, and the parquet is
+    written with a string schema so a gp_code cannot lose a leading zero.
     """
+    rows: list[dict[str, str]] = []
     parquet = data_dir / f"{stem}.parquet"
     if parquet.exists():
-        import pyarrow.parquet as pq
-
         table = pq.read_table(parquet)
         cols = {name: table.column(name).to_pylist() for name in table.column_names}
-        return [
-            {name: ("" if col[i] is None else str(col[i])) for name, col in cols.items()}
+        rows.extend(
+            _rename_legacy(
+                {name: ("" if col[i] is None else str(col[i])) for name, col in cols.items()}
+            )
             for i in range(table.num_rows)
-        ]
+        )
     csv_path = data_dir / f"{stem}.csv"
-    if not csv_path.exists():
-        return []
-    with csv_path.open(newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    if csv_path.exists():
+        with csv_path.open(newline="", encoding="utf-8") as f:
+            rows.extend(_rename_legacy(row) for row in csv.DictReader(f))
+    return rows

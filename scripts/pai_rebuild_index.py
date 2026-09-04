@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build typed global Parquet tables and enforce the PAI data contracts.
 
-Per-block compatibility CSVs are resumable intermediate state. The Parquet
-tables written here are the canonical derived data products. Raw rendered HTML
-and context/status JSON remain under the block tree and are never folded into a
+The per-block typed Parquet tables are the resumable parsed cache. The global
+Parquet tables written here are the canonical derived data products, streamed
+block by block through the reviewed identity repairs. Raw rendered HTML and
+context/status JSON remain under the block tree and are never folded into a
 derived table.
 
 Usage:
@@ -12,7 +13,6 @@ Usage:
 """
 
 import argparse
-import csv
 import hashlib
 import json
 import os
@@ -21,7 +21,6 @@ import shutil
 import sys
 import tempfile
 import uuid
-from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 
@@ -30,37 +29,29 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pai_collect_universe import request_url  # noqa: E402
 from pai_common import (  # noqa: E402
     BLOCK_MANIFEST_FIELDS,
-    DATA_WIDE_CSV,
+    BLOCK_TABLE_FIELDS,
+    BLOCK_TABLES,
     DONE_JSON,
     DROPDOWN_INVENTORY_FIELDS,
-    GP_METADATA_FIELDS,
-    GP_SCORE_FIELDS,
     GP_UNIVERSE_FIELDS,
-    METADATA_CSV,
-    SCORES_LONG_CSV,
-    WIDE_THEME_FIELDS,
     YEAR_CONFIGS,
 )
 from pai_contracts import (  # noqa: E402
     apply_reviewed_score_vector_links,
     apply_reviewed_theme_headers,
     canonicalize_score_gp_codes,
-    csv_to_typed_parquet,
+    rows_to_table,
     rows_to_typed_parquet,
     typed_schema,
     validate_global_tables,
     validate_universe_parquet,
     write_collection_manifest,
 )
+from pai_scraper_resumable import universe_rows  # noqa: E402
 from pai_stores import BlockStore, read_global  # noqa: E402
-
-ANALYSIS_BLOCK_FILES = {
-    "metadata": METADATA_CSV,
-    "scores": SCORES_LONG_CSV,
-    "wide": DATA_WIDE_CSV,
-}
 
 
 def parse_expected(items: list[str]) -> dict[tuple[str, str], int]:
@@ -78,52 +69,36 @@ def parse_expected(items: list[str]) -> dict[tuple[str, str], int]:
     return parsed
 
 
-def read_csv_rows(path: Path) -> list[dict[str, str]]:
-    if not path.exists():
-        return []
-    with path.open(newline="", encoding="utf-8") as handle:
-        return list(csv.DictReader(handle))
-
-
 def read_source_rows(data_dir: Path, stem: str) -> list[dict[str, str]]:
-    """Prefer the live append log, falling back to compacted Parquet."""
-    csv_path = data_dir / f"{stem}.csv"
-    return read_csv_rows(csv_path) if csv_path.exists() else read_global(data_dir, stem)
+    """The whole append log: compacted Parquet history plus the live CSV tail."""
+    return read_global(data_dir, stem)
 
 
 def consolidate_analysis_tables(
     data_dir: Path, destinations: dict[str, Path], years: list[str] | None = None
 ) -> dict[str, int]:
-    """Stream all three block tables together, applying reviewed identity repairs."""
+    """Stream every block's three tables into typed global Parquet, block by block.
+
+    The reviewed identity repairs run on each block's rows before they are typed, so
+    memory stays bounded by one block rather than the national long table.
+    """
     store = BlockStore(data_dir)
     selected_years = years if years is not None else store.years()
-    names = set(ANALYSIS_BLOCK_FILES.values())
-    fields = {
-        "metadata": list(GP_METADATA_FIELDS),
-        "scores": list(GP_SCORE_FIELDS),
-        "wide": [*GP_METADATA_FIELDS, *WIDE_THEME_FIELDS],
-    }
-
-    unknown_destinations = set(destinations) - set(ANALYSIS_BLOCK_FILES)
+    unknown_destinations = set(destinations) - set(BLOCK_TABLES)
     if unknown_destinations:
         raise ValueError(f"unknown analysis destinations: {sorted(unknown_destinations)}")
     counts = {name: 0 for name in destinations}
-    with ExitStack() as stack:
-        writers: dict[str, csv.DictWriter] = {}
+    writers: dict[str, pq.ParquetWriter] = {}
+    try:
         for name, destination in destinations.items():
             destination.parent.mkdir(parents=True, exist_ok=True)
-            handle = stack.enter_context(destination.open("w", newline="", encoding="utf-8"))
-            writer = csv.DictWriter(
-                handle, fieldnames=fields[name], extrasaction="ignore", restval=""
+            schema = typed_schema(list(BLOCK_TABLE_FIELDS[name]), name)
+            writers[name] = pq.ParquetWriter(
+                destination, schema, compression="zstd", compression_level=7
             )
-            writer.writeheader()
-            writers[name] = writer
-
         for year in selected_years:
-            for block in store.iter_blocks(year, names=names):
-                tables = {
-                    name: block.rows(filename) for name, filename in ANALYSIS_BLOCK_FILES.items()
-                }
+            for block in store.iter_blocks(year, names=set(BLOCK_TABLES.values())):
+                tables = {name: block.rows(filename) for name, filename in BLOCK_TABLES.items()}
                 apply_reviewed_score_vector_links(
                     tables["metadata"], tables["scores"], tables["wide"]
                 )
@@ -131,18 +106,21 @@ def consolidate_analysis_tables(
                 apply_reviewed_theme_headers(tables["scores"], tables["wide"])
                 block_rel = block.rel.as_posix()
                 for name, rows in tables.items():
-                    if name not in writers:
+                    if name not in writers or not rows:
                         continue
                     for row in rows:
-                        if "block_dir" in row:
-                            row["block_dir"] = block_rel
-                        if "block_data_wide_csv" in row:
-                            row["block_data_wide_csv"] = f"{block_rel}/{DATA_WIDE_CSV}"
-                        if "block_html_file" in row and row.get("block_page"):
+                        # Cache paths are stored relative to the collection root so a
+                        # moved or renamed staging run leaves no stale paths behind.
+                        row["block_dir"] = block_rel
+                        if row.get("block_page"):
                             page = int(row["block_page"])
                             row["block_html_file"] = f"{block_rel}/html/page_{page:03d}.html"
-                        writers[name].writerow(row)
-                        counts[name] += 1
+                    table = rows_to_table(rows, list(BLOCK_TABLE_FIELDS[name]), name)
+                    writers[name].write_table(table)
+                    counts[name] += table.num_rows
+    finally:
+        for writer in writers.values():
+            writer.close()
     return counts
 
 
@@ -242,14 +220,20 @@ def write_universe_from_store(data_dir: Path, dst: Path, years: list[str]) -> in
     try:
         store = BlockStore(data_dir)
         for year in years:
+            finished: set[str] = set()
+            cached: set[str] = set()
             for block in store.iter_blocks(
-                year, names={"gp_universe.json", "gp_universe_provenance.json"}
+                year, names={DONE_JSON, "gp_universe.json", "gp_universe_provenance.json"}
             ):
+                if block.exists(DONE_JSON):
+                    finished.add(block.rel.as_posix())
                 raw_payload = block.files.get("gp_universe.json")
                 payload = block.json("gp_universe.json")
                 provenance = block.json("gp_universe_provenance.json")
                 if raw_payload is None or payload is None or provenance is None:
                     continue
+                # The cache sits in the block's source/ subdirectory.
+                cached.add(block.rel.parent.as_posix())
                 if payload.get("columns") != ["gp_code", "nm"]:
                     raise AssertionError(f"{block.rel}: unexpected GP-universe schema")
                 actual_sha = hashlib.sha256(raw_payload).hexdigest()
@@ -257,10 +241,9 @@ def write_universe_from_store(data_dir: Path, dst: Path, years: list[str]) -> in
                     raise AssertionError(f"{block.rel}: GP-universe source checksum mismatch")
                 if int(provenance.get("http_status", 0)) != 200:
                     raise AssertionError(f"{block.rel}: GP-universe source was not HTTP 200")
-                if int(provenance.get("gp_rows", -1)) != len(payload.get("rows", [])):
+                if int(provenance.get("gp_rows", -1)) != len(universe_rows(payload)):
                     raise AssertionError(f"{block.rel}: GP-universe provenance row count mismatch")
-                for raw in payload.get("rows", []):
-                    code, raw_name = str(raw[0]), str(raw[1])
+                for code, raw_name in universe_rows(payload):
                     buffered.append(
                         {
                             "year": year,
@@ -272,19 +255,58 @@ def write_universe_from_store(data_dir: Path, dst: Path, years: list[str]) -> in
                             "block_value": str(provenance["block_value"]),
                             "gp_code": code,
                             "gp_name": _clean_handler_name(code, raw_name),
-                            "source_url": str(provenance["url"]),
+                            "source_url": request_url(
+                                str(provenance["url"]), provenance.get("params") or {}
+                            ),
                             "retrieved_utc": str(provenance["retrieved_utc"]),
                             "source_sha256": str(provenance["sha256"]),
                         }
                     )
                     if len(buffered) >= 10_000:
                         flush()
+            # A finished block without its handler response would silently drop
+            # every GP of that block from the universe.
+            uncached = sorted(finished - cached)
+            if uncached:
+                raise AssertionError(
+                    f"{len(uncached)} finished block(s) lack their universe cache; "
+                    f"first: {uncached[0]}"
+                )
         flush()
     finally:
         writer.close()
     if total == 0:
         raise AssertionError(f"no cached official GP-universe rows found under {data_dir}")
     return total
+
+
+def verify_universe_source(universe_dir: Path, years: list[str]) -> dict[str, Any]:
+    """Bind a standalone universe crawl to its own collection manifest.
+
+    A truncated or hand-edited gp_universe.parquet would shrink the denominator
+    and every downstream coverage check would still pass, so the Parquet must
+    match the checksum and row counts its collector recorded.
+    """
+    manifest_path = universe_dir / "collection_manifest.json"
+    parquet_path = universe_dir / "gp_universe.parquet"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    actual_sha = hashlib.sha256(parquet_path.read_bytes()).hexdigest()
+    if manifest["parquet"]["sha256"] != actual_sha:
+        raise AssertionError(f"{parquet_path}: checksum differs from its collection manifest")
+    table = pq.read_table(parquet_path, columns=["year"])
+    if table.num_rows != int(manifest["row_count"]):
+        raise AssertionError(f"{parquet_path}: {table.num_rows} rows != manifest row_count")
+    per_year = pc.value_counts(table.column("year")).to_pylist()
+    counts = {str(item["values"]): int(item["counts"]) for item in per_year}
+    for year in years:
+        declared = manifest["counts_by_year"].get(year, {}).get("parquet_rows")
+        if declared is None:
+            raise AssertionError(f"{manifest_path}: no universe collection for {year}")
+        if counts.get(year, 0) != int(declared):
+            raise AssertionError(
+                f"{parquet_path}: {counts.get(year, 0)} rows for {year} != declared {declared}"
+            )
+    return {"universe_source_sha256": actual_sha, "universe_source_rows": table.num_rows}
 
 
 def copy_universe_years(src: Path, dst: Path, years: list[str]) -> int:
@@ -315,6 +337,14 @@ def build(
     require_national: bool = False,
     universe_data_dir: Path | None = None,
 ) -> dict[str, Any]:
+    if require_national and universe_data_dir is None:
+        # A hierarchy branch that failed before its blocks were enumerated leaves
+        # no cache, so a store-derived denominator can be silently short; the
+        # release denominator must come from the standalone crawl.
+        raise AssertionError(
+            "--national-official-controls requires --universe-data-dir "
+            "(the independent hierarchy crawl)"
+        )
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{out.name}.staging-", dir=out.parent) as stage_name:
         stage = Path(stage_name)
@@ -326,21 +356,11 @@ def build(
             "inventory": stage / "dropdown_inventory.parquet",
             "universe": stage / "gp_universe.parquet",
         }
-        tmp = stage / "csv"
-        tmp.mkdir()
-        temp_csvs = {
-            "metadata": tmp / "gp_metadata.csv",
-            "scores": tmp / "gp_scores_long.csv",
-            "wide": tmp / "gp_scores_wide.csv",
-        }
-        consolidated = consolidate_analysis_tables(data_dir, temp_csvs, years)
+        consolidated = consolidate_analysis_tables(
+            data_dir, {k: outputs[k] for k in ("metadata", "scores", "wide")}, years
+        )
         if any(rows == 0 for rows in consolidated.values()):
             raise AssertionError(f"no analysis rows found under {data_dir}")
-
-        csv_to_typed_parquet(temp_csvs["metadata"], outputs["metadata"], "metadata")
-        csv_to_typed_parquet(temp_csvs["scores"], outputs["scores"], "scores")
-        csv_to_typed_parquet(temp_csvs["wide"], outputs["wide"], "wide")
-        shutil.rmtree(tmp)
 
         raw_manifest = read_source_rows(data_dir, "block_manifest")
         raw_inventory = read_source_rows(data_dir, "dropdown_inventory")
@@ -358,18 +378,26 @@ def build(
         )
 
         selected_years = years or BlockStore(data_dir).years()
+        universe_provenance: dict[str, Any] = {}
         if universe_data_dir is None:
             write_universe_from_store(data_dir, outputs["universe"], selected_years)
         else:
             universe_source = universe_data_dir
             if universe_source.is_dir():
+                universe_provenance = verify_universe_source(universe_source, selected_years)
                 universe_source = universe_source / "gp_universe.parquet"
+            elif require_national:
+                raise AssertionError(
+                    "--national-official-controls needs the universe crawl directory "
+                    "(with its collection_manifest.json), not a bare Parquet file"
+                )
             copy_universe_years(universe_source, outputs["universe"], selected_years)
 
         contract = validate_global_tables(
             outputs["metadata"], outputs["scores"], outputs["wide"], expected, require_national
         )
         contract.update(validate_universe_parquet(outputs["universe"], outputs["metadata"]))
+        contract.update(universe_provenance)
         status_counts = status_row_conservation(data_dir, years)
         if status_counts["done_gp_rows"] != contract["gp_rows"]:
             raise AssertionError(

@@ -25,6 +25,7 @@ Full run:
 
 import argparse
 import asyncio
+import csv
 import hashlib
 import json
 import logging
@@ -37,6 +38,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from filelock import FileLock
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 from tqdm import tqdm
@@ -44,21 +46,24 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pai_common import (  # noqa: E402
     BLOCK_MANIFEST_FIELDS,
+    BLOCK_TABLES,
     DROPDOWN_INVENTORY_FIELDS,
     FLAT_PAGE_SIZE,
-    GP_METADATA_FIELDS,
-    GP_SCORE_FIELDS,
+    OFFICIAL_FINAL_GP_COUNTS,
+    OFFICIAL_FINAL_GP_COUNTS_SOURCE,
+    OVERALL_SLUG,
     YEAR_CONFIGS,
     append_csv_rows,
     read_csv,
     read_json,
-    write_csv_rows,
     write_json,
 )
 from pai_contracts import (  # noqa: E402
     canonicalize_parsed_themes,
+    canonicalize_score_gp_codes,
     load_score_value_exceptions,
     validate_block_rows,
+    write_block_tables,
 )
 from pai_stores import BlockStore  # noqa: E402
 
@@ -87,7 +92,14 @@ BLOCKED_RESOURCE_TYPES = ("image", "font", "media")
 # The results table paginates 100 GPs per "Next 100 >>" click. On the 2023-2024
 # (flat) page the server never marks #btnNext disabled, so we detect the last
 # page by a short page (fewer than FLAT_PAGE_SIZE rows) plus a table-change check.
+# The GridView page index survives the Search postback, so a retrieval that
+# follows a paginated one opens on that later page and silently drops page 1;
+# every retrieval therefore rewinds with #btnPrev until it is disabled.
 NEXT_BUTTON_SELECTOR = "#btnNext"
+PREV_BUTTON_SELECTOR = "#btnPrev"
+MAX_REWIND_CLICKS = 200
+MAX_RERENDER_ATTEMPTS = 3
+PAGER_RENDER_POLLS = 30
 SWEETALERT_OVERLAY_SELECTOR = ".sweet-overlay"
 SWEETALERT_CONFIRM_SELECTOR = (
     ".sweet-alert button.confirm, .sweet-alert .sa-confirm-button-container button"
@@ -170,6 +182,37 @@ def is_real_option(option: dict[str, str]) -> bool:
 
     low = text.lower()
     return not any(bad in low for bad in BAD_OPTION_TEXT)
+
+
+def manifest_header_current(path: Path) -> bool:
+    """Appending rows in the current field order to an older header would misalign columns."""
+    if not path.exists() or path.stat().st_size == 0:
+        return True
+    with FileLock(f"{path}.lock"), path.open(newline="", encoding="utf-8") as handle:
+        header = next(csv.reader(handle), [])
+    return header == BLOCK_MANIFEST_FIELDS
+
+
+def archived_years(out_dir: Path, years: list[str]) -> list[str]:
+    """Years whose block tree exists only as a compact archive.
+
+    Scraping such a year would start a fresh live tree that BlockStore then
+    prefers over the complete archive, hiding every prior block from rebuilds.
+    """
+    store = BlockStore(out_dir)
+    return [year for year in years if store.mode(year) == "archive"]
+
+
+def required_confirmations(prior_status: str, complete_confirm: int, no_data_confirm: int) -> int:
+    """Confirmations a finished block must carry to be trusted on resume.
+
+    A no-data block was confirmed by re-searching ``--no-data-confirm`` times; a
+    data block by ``--complete-confirm`` repeat retrievals. Judging one by the
+    other's threshold re-fetches it on every run without ever catching up.
+    """
+    if prior_status == "done_no_data_available":
+        return 1 + no_data_confirm
+    return 1 + complete_confirm
 
 
 def skip_decision(
@@ -277,16 +320,49 @@ def normalize_gp_name(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value or "").split()).casefold()
 
 
+def universe_rows(payload: dict[str, Any]) -> list[tuple[str, str]]:
+    """(code, raw name) pairs from a GP handler payload, minus the exact ``[null, null]`` sentinel.
+
+    The portal appends that sentinel to some hierarchy responses; any other null
+    is a malformed row and fails, as in the standalone collector.
+    """
+    rows: list[tuple[str, str]] = []
+    for row in payload.get("rows", []):
+        if row == [None, None]:
+            continue
+        if row is None or len(row) != 2 or row[0] is None or row[1] is None:
+            raise RuntimeError(f"GP-universe handler returned a malformed row: {row!r}")
+        rows.append((str(row[0]), str(row[1])))
+    return rows
+
+
+def universe_from_payload(payload: dict[str, Any]) -> dict[str, str]:
+    """Validated {gp_code: name} for a GP handler payload; sentinel-free, no duplicates."""
+    if payload.get("columns") != ["gp_code", "nm"] or not isinstance(payload.get("rows"), list):
+        raise RuntimeError(f"Unexpected GP-universe response schema: {payload!r}")
+    if any(not isinstance(row, list) or len(row) != 2 for row in payload["rows"]):
+        raise RuntimeError("GP-universe handler returned malformed rows")
+    rows = universe_rows(payload)
+    universe = {code: clean_universe_gp_name(code, name) for code, name in rows}
+    if len(universe) != len(rows):
+        raise RuntimeError("GP-universe handler returned duplicate LGD codes")
+    return universe
+
+
 def clean_universe_gp_name(gp_code: str, raw_name: str) -> str:
-    """Remove the handler's trailing ``[LGD code]`` after checking it."""
+    """Remove the handler's trailing ``[LGD code]`` after checking it.
+
+    Only the numeric code is removed: suffixes such as ``Paroo [N]`` / ``Paroo [S]``
+    are part of the official name and distinguish same-name GPs in a block.
+    """
     match = re.match(r"^(.*?)\s*\[(\d+)\]\s*$", raw_name or "")
     if not match:
-        return clean_label(raw_name)
+        return (raw_name or "").strip()
     if match.group(2) != gp_code:
         raise AssertionError(
             f"GP-universe code disagrees with name suffix: {gp_code} != {match.group(2)}"
         )
-    return clean_label(match.group(1))
+    return match.group(1).strip()
 
 
 def link_missing_gp_codes(
@@ -302,39 +378,96 @@ def link_missing_gp_codes(
     for code, name in universe.items():
         codes_by_name.setdefault(normalize_gp_name(name), []).append(code)
 
-    links: dict[str, str] = {}
-    for row in metadata:
+    def resolve(row: dict[str, Any]) -> str:
         name = normalize_gp_name(str(row.get("gp_name", "")))
         existing = str(row.get("gp_code", "")).strip()
-        if existing in universe and normalize_gp_name(universe[existing]) == name:
-            code = existing
-        else:
-            reviewed = reviewed_links.get(name)
-            if reviewed:
-                code = reviewed["gp_code"]
-                if code not in universe:
-                    raise AssertionError(f"reviewed GP code {code} is absent from block universe")
-            else:
-                candidates = codes_by_name.get(name, [])
-                if len(candidates) != 1:
-                    raise AssertionError(
-                        f"GP name {row.get('gp_name')!r} has {len(candidates)} exact universe "
-                        "matches; add a reviewed name link"
-                    )
-                code = candidates[0]
-        links[name] = code
+        if existing in universe:
+            # The code (decoded from the scorecard link) is the identity; the
+            # portal's display name may be misspelled relative to the handler's.
+            return existing
+        reviewed = reviewed_links.get(name)
+        if reviewed:
+            code = reviewed["gp_code"]
+            if code not in universe:
+                raise AssertionError(f"reviewed GP code {code} is absent from block universe")
+            return code
+        candidates = codes_by_name.get(name, [])
+        if len(candidates) != 1:
+            raise AssertionError(
+                f"GP name {row.get('gp_name')!r} has {len(candidates)} exact universe "
+                "matches; add a reviewed name link"
+            )
+        return candidates[0]
 
+    # Resolved per row, not per name: a block may hold two GPs with the same displayed
+    # name that the portal distinguishes only by their LGD codes.
     for rows in (metadata, scores, wide):
         for row in rows:
-            row["gp_code"] = links[normalize_gp_name(str(row.get("gp_name", "")))]
+            row["gp_code"] = resolve(row)
+
+
+def officially_unvalidated_state(year: str, state: str) -> bool:
+    """A state absent from a vintage's Ministry table was not validated for it."""
+    controls = OFFICIAL_FINAL_GP_COUNTS.get(year)
+    return bool(controls) and state not in controls
+
+
+def officially_unscored_state_exception(
+    year: str, state: str, universe: dict[str, str]
+) -> dict[str, Any] | None:
+    """Allow a whole-state "no data" only where the Ministry's final table omits the state.
+
+    West Bengal has GPs in the LGD hierarchy but no PAI 2.0 scores; the reviewed
+    control table (with its PIB source) is the evidence, so no per-block ledger row is
+    needed. Years without controls keep the strict per-block contract.
+    """
+    controls = OFFICIAL_FINAL_GP_COUNTS.get(year)
+    if not controls or state in controls:
+        return None
+    return {
+        "allowed_missing_gp_codes": set(universe),
+        "evidence": (
+            f"{state} is absent from the Ministry's final {year} PAI table "
+            f"({OFFICIAL_FINAL_GP_COUNTS_SOURCE[year]}); the portal reports no scores for the state"
+        ),
+    }
+
+
+def load_partially_scored_states(path: Path | None) -> set[tuple[str, str]]:
+    """(year, state_value) pairs whose official scored total is below the hierarchy.
+
+    Read from the universe collection manifest, which records both numbers per
+    state. In such a state (Goa, Meghalaya) the portal scores a subset of each
+    block's GPs, so the per-block contract is "subset of the universe" and the
+    state total at rebuild time is the completeness check.
+    """
+    if path is None or not path.is_file() or path.stat().st_size == 0:
+        return set()
+    counts = read_json(path)["counts_by_state"]
+    partial: set[tuple[str, str]] = set()
+    for key, row in counts.items():
+        published = int(row.get("published_scored_gp_count", -1))
+        if 0 < published < int(row["hierarchy_gp_rows"]):
+            year, state_value = key.split(":", 1)
+            partial.add((year, state_value))
+    return partial
 
 
 def validate_gp_universe(
     score_codes: set[str],
     universe_codes: set[str],
     exception: dict[str, Any] | None = None,
+    *,
+    allow_subset: bool = False,
+    no_data_confirmed: bool = False,
 ) -> dict[str, Any]:
-    """Require score results to match the portal's block GP universe exactly."""
+    """Require score results to match the portal's block GP universe exactly.
+
+    With ``allow_subset`` (a partially scored state) unscored universe GPs are
+    permitted and reported; GPs outside the universe never are. An empty result
+    is a subset only when the portal's "not available" alert confirmed it
+    (``no_data_confirmed``); an empty table with no alert is a failed render.
+    """
     missing = universe_codes - score_codes
     unexpected = score_codes - universe_codes
     allowed_missing = exception["allowed_missing_gp_codes"] if exception else set()
@@ -344,6 +477,14 @@ def validate_gp_universe(
             "score result has GP codes absent from the official block universe: "
             + ";".join(sorted(unexpected))
         )
+    if allow_subset and missing and missing != allowed_missing:
+        if not score_codes and not no_data_confirmed:
+            raise AssertionError("empty score result cannot be accepted as a universe subset")
+        return {
+            "status": "subset_in_partially_scored_state",
+            "missing": missing,
+            "unexpected": unexpected,
+        }
     if missing != allowed_missing:
         raise AssertionError(
             "score result does not match the official block universe: "
@@ -371,8 +512,8 @@ def cached_universe_is_valid(block_dir: Path, done: dict[str, Any]) -> bool:
             and isinstance(rows, list)
             and provenance.get("http_status") == 200
             and provenance.get("sha256") == hashlib.sha256(raw).hexdigest()
-            and int(provenance.get("gp_rows", -1)) == len(rows)
-            and int(done.get("universe_gp_rows", -1)) == len(rows)
+            and int(provenance.get("gp_rows", -1)) == len(universe_rows(payload))
+            and int(done.get("universe_gp_rows", -1)) == len(universe_rows(payload))
         )
     except KeyError, OSError, TypeError, ValueError, json.JSONDecodeError:
         return False
@@ -399,16 +540,8 @@ async def fetch_gp_universe(
         raise RuntimeError(f"GP-universe handler returned HTTP {response.status}")
     raw = await response.body()
     payload = json.loads(raw)
-    if payload.get("columns") != ["gp_code", "nm"] or not isinstance(payload.get("rows"), list):
-        raise RuntimeError(f"Unexpected GP-universe response schema: {payload!r}")
-    if any(not isinstance(row, list) or len(row) != 2 for row in payload["rows"]):
-        raise RuntimeError("GP-universe handler returned malformed rows")
-    universe = {
-        str(row[0]): clean_universe_gp_name(str(row[0]), str(row[1])) for row in payload["rows"]
-    }
+    universe = universe_from_payload(payload)
     codes = list(universe)
-    if len(codes) != len(payload["rows"]):
-        raise RuntimeError("GP-universe handler returned duplicate LGD codes")
 
     source_dir = block_dir / "source"
     source_dir.mkdir(parents=True, exist_ok=True)
@@ -718,8 +851,8 @@ async def save_html(page, html_path: Path) -> None:
     html_path.write_text(await page.content(), encoding="utf-8")
 
 
-async def next_button_enabled(page) -> bool:
-    loc = page.locator(NEXT_BUTTON_SELECTOR)
+async def pager_button_enabled(page, selector: str) -> bool:
+    loc = page.locator(selector)
     if await loc.count() == 0:
         return False
 
@@ -749,26 +882,36 @@ async def table_signature(page, result_selector: str = RESULT_TABLE_SELECTOR) ->
     )
 
 
-async def click_next_page(
-    page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR
+async def click_pager_button(
+    page,
+    selector: str,
+    logger: logging.Logger,
+    result_selector: str = RESULT_TABLE_SELECTOR,
 ) -> bool:
-    """Click "Next 100" and wait for the table to change. Returns True if it
-    changed (a new page loaded), False if it did not (we are at the last page)."""
+    """Click a pager button and wait for the table to change.
+
+    Returns True when another page rendered, False when the portal answered with
+    its "not available" alert (no page in that direction: a block of exactly 100
+    GPs has Next enabled on its only page). A click that renders nothing within
+    the poll budget is a stalled server, not a last page, and raises so the
+    block is retried rather than truncated.
+    """
     await dismiss_sweetalert(page, logger)
 
     old_sig = await table_signature(page, result_selector)
 
-    await page.click(NEXT_BUTTON_SELECTOR, timeout=30000)
+    await page.click(selector, timeout=30000)
 
     try:
         await page.wait_for_load_state("commit", timeout=15000)
     except Exception:
         pass
 
-    for _ in range(30):
+    alert_seen = False
+    for _ in range(PAGER_RENDER_POLLS):
         await page.wait_for_timeout(1000)
 
-        await dismiss_sweetalert(page, logger)
+        alert_seen = bool(await dismiss_sweetalert(page, logger)) or alert_seen
 
         try:
             if await page.locator("#ddl_State").count() > 0:
@@ -778,8 +921,51 @@ async def click_next_page(
         except Exception:
             pass
 
-    logger.warning("Table signature did not change after Next click; treating as last page.")
-    return False
+    if alert_seen:
+        logger.info("%s click answered by the no-data alert; treating as end.", selector)
+        return False
+    raise RuntimeError(
+        f"results did not render within {PAGER_RENDER_POLLS}s after {selector} click"
+    )
+
+
+async def reset_page_index(
+    page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR
+) -> int:
+    """Click Prev until it is disabled so the next postback starts from page 1.
+
+    Needed before every Search as well as after one: a block of exactly 100 GPs
+    leaves the index on an empty "page 2" (the server answers Next with the
+    "not available" alert), and the following Search then also returns that alert.
+    """
+    clicks = 0
+    while await pager_button_enabled(page, PREV_BUTTON_SELECTOR):
+        if clicks >= MAX_REWIND_CLICKS:
+            raise RuntimeError(f"Could not rewind results to page 1 in {clicks} clicks")
+        if not await click_pager_button(page, PREV_BUTTON_SELECTOR, logger, result_selector):
+            raise RuntimeError("Prev is enabled but the results table did not change")
+        clicks += 1
+    return clicks
+
+
+async def rewind_to_first_page(
+    page, logger: logging.Logger, result_selector: str = RESULT_TABLE_SELECTOR
+) -> int:
+    """Return to page 1 of a freshly retrieved result set. Returns the Prev clicks needed.
+
+    The Prev postback renders score cells without their grade/band text, so after
+    rewinding the page index the result is re-requested through Search, which renders
+    page 1 in full now that the index is back at zero.
+    """
+    clicks = await reset_page_index(page, logger, result_selector)
+    if clicks:
+        alert = await click_search(page, logger, result_selector)
+        if alert or await page.locator(result_selector).count() == 0:
+            raise RuntimeError("Re-search after rewinding to page 1 returned no data/table")
+        if await pager_button_enabled(page, PREV_BUTTON_SELECTOR):
+            raise RuntimeError("Results did not stay on page 1 after re-search")
+        logger.info("Rewound results table to page 1 (%s Prev clicks) and re-searched", clicks)
+    return clicks
 
 
 async def parse_current_table(
@@ -1102,7 +1288,6 @@ def enrich_metadata_row(
     gp: dict[str, Any],
     block_page: int,
     block_dir: Path,
-    data_wide_csv: Path,
     html_file: Path,
     source_url: str,
 ) -> dict[str, Any]:
@@ -1114,10 +1299,60 @@ def enrich_metadata_row(
         "details_raw": gp.get("details_raw", ""),
         "block_page": block_page,
         "block_dir": str(block_dir),
-        "block_data_wide_csv": str(data_wide_csv),
         "block_html_file": str(html_file),
         "source_url": source_url,
     }
+
+
+def rows_lack_grades(rows: list[dict[str, Any]]) -> bool:
+    """True when a parsed page has theme scores but not one grade cell.
+
+    The portal's render mode is server-global: for a second or so after any
+    session clicks a pager button, every session's postback renders score cells
+    as bare numbers. With several workers that collision is routine, so a
+    grade-less page is re-requested rather than stored or compared.
+    """
+    theme_scores = [
+        score
+        for item in rows
+        for score in item.get("scores", [])
+        if score.get("theme_slug") != OVERALL_SLUG
+    ]
+    return bool(theme_scores) and all(not score.get("grade") for score in theme_scores)
+
+
+def page_signature(rows: list[dict[str, Any]]) -> tuple[str, ...]:
+    return tuple(item["gp"].get("gp_code") or item["gp"].get("gp_name", "") for item in rows)
+
+
+async def parse_rendered_page(
+    page,
+    *,
+    result_selector: str,
+    layout: str,
+    html_path: Path,
+    logger: logging.Logger,
+    where: str,
+) -> dict[str, Any]:
+    """Save and parse the current results page, re-rendering it if grades are missing."""
+    await save_html(page, html_path)
+    parsed = await parse_current_table(page, result_selector, layout)
+    for attempt in range(1, MAX_RERENDER_ATTEMPTS + 1):
+        if not rows_lack_grades(parsed.get("rows", [])):
+            return parsed
+        logger.warning("%s: page rendered without grades; re-rendering (%s)", where, attempt)
+        before = page_signature(parsed["rows"])
+        await page.wait_for_timeout(1500)
+        alert = await click_search(page, logger, result_selector)
+        if alert or await page.locator(result_selector).count() == 0:
+            raise RuntimeError(f"{where}: re-render returned no data/table")
+        await save_html(page, html_path)
+        parsed = await parse_current_table(page, result_selector, layout)
+        if page_signature(parsed.get("rows", [])) != before:
+            raise RuntimeError(f"{where}: results changed while re-rendering; retry")
+    if not rows_lack_grades(parsed.get("rows", [])):
+        return parsed
+    raise RuntimeError(f"{where}: page still rendered without grades; retry")
 
 
 async def collect_result_pages(
@@ -1129,7 +1364,6 @@ async def collect_result_pages(
     block: dict[str, str],
     base_meta: dict[str, Any],
     block_dir: Path,
-    data_wide_csv: Path,
     html_dir: Path,
     html_prefix: str,
     result_selector: str,
@@ -1143,11 +1377,22 @@ async def collect_result_pages(
     all_score_rows: list[dict[str, Any]] = []
     page_no = 1
     prev_sig: tuple | None = None
+    await rewind_to_first_page(page, logger, result_selector)
 
+    where = (
+        f"{clean_label(state['text'])} / {clean_label(district['text'])} / "
+        f"{clean_label(block['text'])}"
+    )
     while True:
         html_path = html_dir / f"{html_prefix}page_{page_no:03d}.html"
-        await save_html(page, html_path)
-        parsed = await parse_current_table(page, result_selector, layout)
+        parsed = await parse_rendered_page(
+            page,
+            result_selector=result_selector,
+            layout=layout,
+            html_path=html_path,
+            logger=logger,
+            where=f"{where} {html_prefix}page {page_no}",
+        )
         rows = parsed.get("rows", [])
         logger.info(
             "[%s] %s / %s / %s %spage %s: parsed %s GP rows",
@@ -1160,7 +1405,7 @@ async def collect_result_pages(
             len(rows),
         )
 
-        cur_sig = tuple(item["gp"].get("gp_code") or item["gp"].get("gp_name", "") for item in rows)
+        cur_sig = page_signature(rows)
         if page_no > 1 and cur_sig == prev_sig:
             break
         prev_sig = cur_sig
@@ -1172,7 +1417,6 @@ async def collect_result_pages(
                 gp=gp,
                 block_page=page_no,
                 block_dir=block_dir,
-                data_wide_csv=data_wide_csv,
                 html_file=html_path,
                 source_url=page.url,
             )
@@ -1195,13 +1439,13 @@ async def collect_result_pages(
         if layout == "flat":
             if len(rows) < FLAT_PAGE_SIZE:
                 break
-        elif not await next_button_enabled(page):
+        elif not await pager_button_enabled(page, NEXT_BUTTON_SELECTOR):
             break
 
         page_no += 1
         if max_pages_per_block and page_no > max_pages_per_block:
             raise RuntimeError(f"Exceeded --max-pages-per-block={max_pages_per_block}")
-        if not await click_next_page(page, logger, result_selector):
+        if not await click_pager_button(page, NEXT_BUTTON_SELECTOR, logger, result_selector):
             break
 
     return all_meta_rows, all_score_rows, all_wide_rows, page_no
@@ -1221,9 +1465,7 @@ async def scrape_block(
 ) -> dict[str, Any]:
     block_dir = build_block_dir(out_dir, year, state, district, block)
     html_dir = block_dir / "html"
-    data_wide_csv = block_dir / "data_wide.csv"
-    metadata_csv = block_dir / "metadata.csv"
-    scores_long_csv = block_dir / "scores_long.csv"
+    table_paths = {kind: block_dir / name for kind, name in BLOCK_TABLES.items()}
     done_json = block_dir / "DONE.json"
     failed_json = block_dir / "FAILED.json"
 
@@ -1234,6 +1476,11 @@ async def scrape_block(
     baseline = args.baseline_gp_counts.get(key)
     exception = args.universe_exceptions.get(key)
     reviewed_name_links = args.gp_name_links.get(key)
+    # The portal may display unvalidated scores for a state the Ministry excluded;
+    # they are collected as displayed and kept out of the release by the package.
+    allow_subset = (year, state["value"]) in args.partially_scored_states or (
+        officially_unvalidated_state(year, clean_label(state["text"]))
+    )
     universe: dict[str, str] = {}
 
     def audit_count(
@@ -1275,13 +1522,13 @@ async def scrape_block(
     if prior and not args.overwrite:
         prior_status = prior.get("status", "")
         prior_rows = int(prior.get("gp_rows", 0) or 0)
-        required_confirmations = 1 + args.complete_confirm
+        required = required_confirmations(prior_status, args.complete_confirm, args.no_data_confirm)
         prior_confirmations = int(prior.get("retrieval_confirmations", 0) or 0)
         decision = None
         has_universe_contract = prior.get(
             "universe_contract_version"
         ) == 1 and cached_universe_is_valid(block_dir, prior)
-        if prior_confirmations >= required_confirmations and has_universe_contract:
+        if prior_confirmations >= required and has_universe_contract:
             decision = skip_decision(
                 prior_status,
                 prior_rows,
@@ -1294,7 +1541,7 @@ async def scrape_block(
                 "Rechecking legacy/unconfirmed DONE block (%s/%s confirmations, "
                 "universe contract=%s): %s",
                 prior_confirmations,
-                required_confirmations,
+                required,
                 has_universe_contract,
                 block_dir,
             )
@@ -1303,9 +1550,9 @@ async def scrape_block(
             return {
                 "status": "skipped_no_data",
                 "block_dir": str(block_dir),
-                "data_wide_csv": str(data_wide_csv),
-                "metadata_csv": str(metadata_csv),
-                "scores_long_csv": str(scores_long_csv),
+                "metadata_file": str(table_paths["metadata"]),
+                "scores_file": str(table_paths["scores"]),
+                "wide_file": str(table_paths["wide"]),
                 "html_pages": 0,
                 "gp_rows": 0,
                 "score_rows": 0,
@@ -1316,9 +1563,9 @@ async def scrape_block(
             return {
                 "status": "skipped_done",
                 "block_dir": str(block_dir),
-                "data_wide_csv": str(data_wide_csv),
-                "metadata_csv": str(metadata_csv),
-                "scores_long_csv": str(scores_long_csv),
+                "metadata_file": str(table_paths["metadata"]),
+                "scores_file": str(table_paths["scores"]),
+                "wide_file": str(table_paths["wide"]),
                 "html_pages": prior.get("html_pages", 0),
                 "gp_rows": prior.get("gp_rows", 0),
                 "score_rows": prior.get("score_rows", 0),
@@ -1341,6 +1588,7 @@ async def scrape_block(
 
     await ensure_state_district(page, state, district, logger)
     await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
+    await reset_page_index(page, logger, result_selector)
     alert_msg = await click_search(page, logger, result_selector)
 
     where = (
@@ -1357,6 +1605,7 @@ async def scrape_block(
         confirmations = 1
         for attempt in range(1, args.no_data_confirm + 1):
             await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
+            await reset_page_index(page, logger, result_selector)
             recheck = await click_search(page, logger, result_selector)
             if recheck and "not available" in recheck.lower():
                 confirmations += 1
@@ -1381,8 +1630,17 @@ async def scrape_block(
             raise RuntimeError(f"Indeterminate no-data recheck for {where} (server stress); retry")
 
         if alert_msg:  # still "not available" after all confirmations -> genuine
+            no_data_exception = exception or officially_unscored_state_exception(
+                year, clean_label(state["text"]), universe
+            )
             try:
-                universe_check = validate_gp_universe(set(), set(universe), exception)
+                universe_check = validate_gp_universe(
+                    set(),
+                    set(universe),
+                    no_data_exception,
+                    allow_subset=allow_subset,
+                    no_data_confirmed=True,
+                )
             except AssertionError:
                 audit_count(
                     confirmations,
@@ -1411,9 +1669,9 @@ async def scrape_block(
                 "block": clean_label(block["text"]),
                 "block_value": block["value"],
                 "block_dir": str(block_dir),
-                "data_wide_csv": str(data_wide_csv),
-                "metadata_csv": str(metadata_csv),
-                "scores_long_csv": str(scores_long_csv),
+                "metadata_file": str(table_paths["metadata"]),
+                "scores_file": str(table_paths["scores"]),
+                "wide_file": str(table_paths["wide"]),
                 "html_pages": 0,
                 "gp_rows": 0,
                 "score_rows": 0,
@@ -1422,7 +1680,10 @@ async def scrape_block(
                 "retrieval_confirmations": confirmations,
                 "universe_contract_version": 1,
                 "universe_gp_rows": len(universe),
-                "universe_exception_evidence": exception["evidence"] if exception else "",
+                "universe_contract_status": universe_check["status"],
+                "universe_exception_evidence": (
+                    no_data_exception["evidence"] if no_data_exception else ""
+                ),
             }
             write_json(done_json, done_obj)
             if failed_json.exists():
@@ -1460,7 +1721,6 @@ async def scrape_block(
         block=block,
         base_meta=base_meta,
         block_dir=block_dir,
-        data_wide_csv=data_wide_csv,
         html_dir=html_dir,
         html_prefix="",
         result_selector=result_selector,
@@ -1468,6 +1728,9 @@ async def scrape_block(
         max_pages_per_block=args.max_pages_per_block,
         logger=logger,
     )
+    # A truncated display ID ("27" for 272000) is never a universe code; the full
+    # LGD code sits in the scorecard URL, so decode it before any name linking.
+    canonicalize_score_gp_codes(all_meta_rows, all_score_rows, all_wide_rows)
     link_missing_gp_codes(
         all_meta_rows,
         all_score_rows,
@@ -1483,7 +1746,9 @@ async def scrape_block(
     )
     live_codes = {str(row["gp_code"]) for row in all_meta_rows}
     try:
-        universe_check = validate_gp_universe(live_codes, set(universe), exception)
+        universe_check = validate_gp_universe(
+            live_codes, set(universe), exception, allow_subset=allow_subset
+        )
     except AssertionError:
         audit_count(
             1,
@@ -1505,6 +1770,7 @@ async def scrape_block(
     for confirmation in range(1, args.complete_confirm + 1):
         await ensure_state_district(page, state, district, logger)
         await select_value(page, "#ddl_Block", block["value"], wait_ms=700)
+        await reset_page_index(page, logger, result_selector)
         confirmation_alert = await click_search(page, logger, result_selector)
         if confirmation_alert or await page.locator(result_selector).count() == 0:
             audit_count(confirmation + 1, set(), "unstable_confirmation")
@@ -1517,7 +1783,6 @@ async def scrape_block(
             block=block,
             base_meta=base_meta,
             block_dir=block_dir,
-            data_wide_csv=data_wide_csv,
             html_dir=html_dir,
             html_prefix=f"confirm_{confirmation:02d}_",
             result_selector=result_selector,
@@ -1525,6 +1790,7 @@ async def scrape_block(
             max_pages_per_block=args.max_pages_per_block,
             logger=logger,
         )
+        canonicalize_score_gp_codes(confirm_meta, confirm_scores, confirm_wide)
         link_missing_gp_codes(
             confirm_meta,
             confirm_scores,
@@ -1540,7 +1806,9 @@ async def scrape_block(
         )
         confirm_codes = {str(row["gp_code"]) for row in confirm_meta}
         try:
-            confirm_universe = validate_gp_universe(confirm_codes, set(universe), exception)
+            confirm_universe = validate_gp_universe(
+                confirm_codes, set(universe), exception, allow_subset=allow_subset
+            )
         except AssertionError:
             audit_count(
                 confirmation + 1,
@@ -1564,9 +1832,10 @@ async def scrape_block(
                 f"({len(all_meta_rows)} vs {len(confirm_meta)} GPs); retry"
             )
 
-    write_csv_rows(metadata_csv, all_meta_rows, GP_METADATA_FIELDS)
-    write_csv_rows(scores_long_csv, all_score_rows, GP_SCORE_FIELDS)
-    write_csv_rows(data_wide_csv, all_wide_rows)
+    try:
+        write_block_tables(block_dir, all_meta_rows, all_score_rows, all_wide_rows)
+    except AssertionError as exc:
+        raise AssertionError(f"{where}: typed block table rejected: {exc}") from exc
 
     status = "done" if all_meta_rows else "done_no_rows"
     done_obj = {
@@ -1581,9 +1850,9 @@ async def scrape_block(
         "block": clean_label(block["text"]),
         "block_value": block["value"],
         "block_dir": str(block_dir),
-        "data_wide_csv": str(data_wide_csv),
-        "metadata_csv": str(metadata_csv),
-        "scores_long_csv": str(scores_long_csv),
+        "metadata_file": str(table_paths["metadata"]),
+        "scores_file": str(table_paths["scores"]),
+        "wide_file": str(table_paths["wide"]),
         "html_pages": page_no,
         "gp_rows": len(all_meta_rows),
         "score_rows": len(all_score_rows),
@@ -1591,6 +1860,7 @@ async def scrape_block(
         "baseline_gp_rows": baseline,
         "universe_contract_version": 1,
         "universe_gp_rows": len(universe),
+        "universe_contract_status": universe_check["status"],
         "universe_exception_evidence": exception["evidence"] if exception else "",
     }
     write_json(done_json, done_obj)
@@ -1683,9 +1953,9 @@ async def scrape_year(
                     "block": "",
                     "block_value": "",
                     "block_dir": "",
-                    "data_wide_csv": "",
-                    "metadata_csv": "",
-                    "scores_long_csv": "",
+                    "metadata_file": "",
+                    "scores_file": "",
+                    "wide_file": "",
                     "html_pages": "",
                     "gp_rows": "",
                     "score_rows": "",
@@ -1749,9 +2019,9 @@ async def scrape_year(
                         "block": "",
                         "block_value": "",
                         "block_dir": "",
-                        "data_wide_csv": "",
-                        "metadata_csv": "",
-                        "scores_long_csv": "",
+                        "metadata_file": "",
+                        "scores_file": "",
+                        "wide_file": "",
                         "html_pages": "",
                         "gp_rows": "",
                         "score_rows": "",
@@ -1889,6 +2159,7 @@ async def scrape_year(
                 }
 
                 success_or_skip = False
+                server_touched = False
 
                 for attempt in range(1, args.max_retries + 1):
                     try:
@@ -1912,9 +2183,9 @@ async def scrape_year(
                                     **manifest_base,
                                     "timestamp_utc": utc_now(),
                                     "status": result.get("status", ""),
-                                    "data_wide_csv": result.get("data_wide_csv", ""),
-                                    "metadata_csv": result.get("metadata_csv", ""),
-                                    "scores_long_csv": result.get("scores_long_csv", ""),
+                                    "metadata_file": result.get("metadata_file", ""),
+                                    "scores_file": result.get("scores_file", ""),
+                                    "wide_file": result.get("wide_file", ""),
                                     "html_pages": result.get("html_pages", ""),
                                     "gp_rows": result.get("gp_rows", ""),
                                     "score_rows": result.get("score_rows", ""),
@@ -1925,9 +2196,11 @@ async def scrape_year(
                         )
 
                         success_or_skip = True
+                        server_touched = not str(result.get("status", "")).startswith("skipped")
                         break
 
                     except Exception as e:
+                        server_touched = True
                         logger.error(
                             "[%s] Block failed attempt %s/%s: %s / %s / %s :: %s",
                             year,
@@ -1974,9 +2247,9 @@ async def scrape_year(
                                 **manifest_base,
                                 "timestamp_utc": utc_now(),
                                 "status": "failed",
-                                "data_wide_csv": "",
-                                "metadata_csv": "",
-                                "scores_long_csv": "",
+                                "metadata_file": "",
+                                "scores_file": "",
+                                "wide_file": "",
                                 "html_pages": "",
                                 "gp_rows": "",
                                 "score_rows": "",
@@ -1999,12 +2272,25 @@ async def scrape_year(
                         )
                         break
 
-                await page.wait_for_timeout(int(args.delay * 1000))
+                if server_touched:
+                    await page.wait_for_timeout(int(args.delay * 1000))
 
 
 async def main_async(args) -> None:
     out_dir = Path(args.out)
     logger = setup_logger(out_dir)
+    manifest_path = out_dir / "block_manifest.csv"
+    if not manifest_header_current(manifest_path):
+        raise SystemExit(
+            f"{manifest_path} has a header from an older schema; run "
+            "scripts/pai_migrate_block_tables.py before scraping"
+        )
+    archived = archived_years(out_dir, args.years)
+    if archived:
+        raise SystemExit(
+            f"{archived} exist only as compact archives under {out_dir}; "
+            "run `make expand YEAR=<year>` before resuming a scrape"
+        )
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     args.baseline_gp_counts = (
         load_baseline_gp_counts(Path(args.baseline_counts_from), args.years)
@@ -2018,22 +2304,35 @@ async def main_async(args) -> None:
         Path(args.gp_name_links) if args.gp_name_links else None
     )
     args.allowed_null_scores = set(load_score_value_exceptions())
+    args.partially_scored_states = load_partially_scored_states(
+        Path(args.hierarchy_manifest) if args.hierarchy_manifest else None
+    )
 
     logger.info("=" * 90)
     logger.info("PAI resumable scrape run_id=%s", run_id)
+    logger.info("argv=%s", " ".join(sys.argv[1:]))
     logger.info("Output directory=%s", out_dir.resolve())
     logger.info("Years=%s", args.years)
     logger.info("Prior-count diagnostics loaded=%s", len(args.baseline_gp_counts))
     logger.info("Reviewed universe exceptions loaded=%s", len(args.universe_exceptions))
     logger.info("Reviewed GP-name link blocks loaded=%s", len(args.gp_name_links))
+    logger.info(
+        "Partially scored states (subset contract)=%s", sorted(args.partially_scored_states)
+    )
+    if not args.hierarchy_manifest or not Path(args.hierarchy_manifest).is_file():
+        logger.warning(
+            "No hierarchy manifest at %s: every block must match its universe exactly, so "
+            "partially scored states (Goa, Meghalaya, most PAI 1.0 states) will fail",
+            args.hierarchy_manifest,
+        )
     logger.info("=" * 90)
 
     if args.reset_global_indexes:
         for p in [
             out_dir / "block_manifest.csv",
+            out_dir / "block_manifest.parquet",
             out_dir / "dropdown_inventory.csv",
-            out_dir / "gp_metadata.csv",
-            out_dir / "gp_scores_long.csv",
+            out_dir / "dropdown_inventory.parquet",
         ]:
             if p.exists():
                 logger.info("Removing existing global index: %s", p)
@@ -2092,9 +2391,9 @@ async def main_async(args) -> None:
                             "block": "",
                             "block_value": "",
                             "block_dir": "",
-                            "data_wide_csv": "",
-                            "metadata_csv": "",
-                            "scores_long_csv": "",
+                            "metadata_file": "",
+                            "scores_file": "",
+                            "wide_file": "",
                             "html_pages": "",
                             "gp_rows": "",
                             "score_rows": "",
@@ -2126,6 +2425,7 @@ async def main_async(args) -> None:
             parse_expected(args.expected_state_gps),
             args.years,
             args.national_official_controls,
+            universe_data_dir=Path(args.universe_data_dir) if args.universe_data_dir else None,
         )
         logger.info(
             "Derived contract passed: gp_rows=%s score_rows=%s -> %s",
@@ -2185,6 +2485,12 @@ def parse_args() -> argparse.Namespace:
         help="Reviewed CSV of intentionally unscored GP codes, each with evidence",
     )
     parser.add_argument(
+        "--hierarchy-manifest",
+        default="runs/pai_universe/collection_manifest.json",
+        help="Universe collection_manifest.json; states scored below their hierarchy "
+        "size accept blocks that are a subset of the universe (default: the standalone crawl)",
+    )
+    parser.add_argument(
         "--gp-name-links",
         help="Reviewed CSV linking ambiguous score GP names to universe GP codes",
     )
@@ -2224,7 +2530,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--block-third-party", action="store_true")
     parser.add_argument("--allow-year-mismatch", action="store_true")
 
-    parser.add_argument("--reset-global-indexes", action="store_true")
+    parser.add_argument(
+        "--reset-global-indexes",
+        action="store_true",
+        help="Remove the append-only logs, including their compacted Parquet history "
+        "(resumption reads DONE.json, never the logs)",
+    )
     parser.add_argument(
         "--expected-state-gps",
         action="append",
@@ -2241,6 +2552,11 @@ def parse_args() -> argparse.Namespace:
         "--national-official-controls",
         action="store_true",
         help="Require all 33 PAI 2.0 state controls and the India total at final rebuild",
+    )
+    parser.add_argument(
+        "--universe-data-dir",
+        help="Independent universe crawl (dir or gp_universe.parquet) for the final rebuild; "
+        "required with --national-official-controls",
     )
 
     return parser.parse_args()

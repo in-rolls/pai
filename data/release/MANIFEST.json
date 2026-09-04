@@ -1,0 +1,752 @@
+{
+  "version": "0.2.0",
+  "created_utc": "2026-09-05T20:41:42+00:00",
+  "unit": "one hierarchy Gram Panchayat in one PAI fiscal-year vintage",
+  "key": [
+    "year",
+    "gp_code"
+  ],
+  "years": [
+    "2022-2023",
+    "2023-2024"
+  ],
+  "official_counts_checked": {
+    "2022-2023:Andaman And Nicobar Islands": {
+      "actual": 70,
+      "expected": 70
+    },
+    "2022-2023:Andhra Pradesh": {
+      "actual": 13310,
+      "expected": 13310
+    },
+    "2022-2023:Arunachal Pradesh": {
+      "actual": 2108,
+      "expected": 2108
+    },
+    "2022-2023:Assam": {
+      "actual": 2154,
+      "expected": 2183,
+      "reviewed_portal_count": 2154,
+      "evidence": "PIB PRID 2120320 (9 Apr 2025) lists 2183 Assam GPs with validated PAI 2022-23 data; the portal's block tables display 2154 in two independent double retrievals (June 2026 and 5 Sep 2026, identical per block). The 29 undisplayed GPs fall in six subset blocks (Gobardhana 6/20, Narayanpur 7/14, Binakandi 20/24, Amguri 9/10, Chamaria 14/15, Chhaygaon Maa Chandika 6/7) and Karbi Anglong/Chirang no-data blocks; block_count_audit.csv records the missing LGD codes."
+    },
+    "2022-2023:Bihar": {
+      "actual": 8053,
+      "expected": 8053
+    },
+    "2022-2023:Chhattisgarh": {
+      "actual": 11643,
+      "expected": 11643
+    },
+    "2022-2023:Gujarat": {
+      "actual": 14618,
+      "expected": 14618
+    },
+    "2022-2023:Haryana": {
+      "actual": 6223,
+      "expected": 6223
+    },
+    "2022-2023:Himachal Pradesh": {
+      "actual": 3328,
+      "expected": 3328
+    },
+    "2022-2023:Jammu And Kashmir": {
+      "actual": 4291,
+      "expected": 4291
+    },
+    "2022-2023:Jharkhand": {
+      "actual": 4281,
+      "expected": 4281
+    },
+    "2022-2023:Karnataka": {
+      "actual": 5907,
+      "expected": 5907
+    },
+    "2022-2023:Kerala": {
+      "actual": 941,
+      "expected": 941
+    },
+    "2022-2023:Ladakh": {
+      "actual": 193,
+      "expected": 193
+    },
+    "2022-2023:Lakshadweep": {
+      "actual": 10,
+      "expected": 10
+    },
+    "2022-2023:Madhya Pradesh": {
+      "actual": 23011,
+      "expected": 23011
+    },
+    "2022-2023:Maharashtra": {
+      "actual": 27655,
+      "expected": 27655
+    },
+    "2022-2023:Manipur": {
+      "actual": 1976,
+      "expected": 1976
+    },
+    "2022-2023:Mizoram": {
+      "actual": 834,
+      "expected": 834
+    },
+    "2022-2023:Odisha": {
+      "actual": 6794,
+      "expected": 6794
+    },
+    "2022-2023:Punjab": {
+      "actual": 10514,
+      "expected": 10514
+    },
+    "2022-2023:Rajasthan": {
+      "actual": 10634,
+      "expected": 10634
+    },
+    "2022-2023:Sikkim": {
+      "actual": 199,
+      "expected": 199
+    },
+    "2022-2023:Tamil Nadu": {
+      "actual": 12525,
+      "expected": 12525
+    },
+    "2022-2023:Telangana": {
+      "actual": 12768,
+      "expected": 12768
+    },
+    "2022-2023:The Dadra And Nagar Haveli And Daman And Diu": {
+      "actual": 38,
+      "expected": 38
+    },
+    "2022-2023:Tripura": {
+      "actual": 1176,
+      "expected": 1176
+    },
+    "2022-2023:Uttar Pradesh": {
+      "actual": 23207,
+      "expected": 23207
+    },
+    "2022-2023:Uttarakhand": {
+      "actual": 7795,
+      "expected": 7795
+    },
+    "2022-2023:__india__": {
+      "actual": 216256,
+      "expected": 216285,
+      "reviewed_portal_shortfall": 29
+    },
+    "2023-2024:Andaman And Nicobar Islands": {
+      "actual": 70,
+      "expected": 70
+    },
+    "2023-2024:Andhra Pradesh": {
+      "actual": 13310,
+      "expected": 13310
+    },
+    "2023-2024:Arunachal Pradesh": {
+      "actual": 2108,
+      "expected": 2108
+    },
+    "2023-2024:Assam": {
+      "actual": 2192,
+      "expected": 2192
+    },
+    "2023-2024:Bihar": {
+      "actual": 8053,
+      "expected": 8053
+    },
+    "2023-2024:Chhattisgarh": {
+      "actual": 11643,
+      "expected": 11643
+    },
+    "2023-2024:Goa": {
+      "actual": 188,
+      "expected": 188
+    },
+    "2023-2024:Gujarat": {
+      "actual": 14534,
+      "expected": 14534
+    },
+    "2023-2024:Haryana": {
+      "actual": 6225,
+      "expected": 6225
+    },
+    "2023-2024:Himachal Pradesh": {
+      "actual": 3615,
+      "expected": 3615
+    },
+    "2023-2024:Jammu And Kashmir": {
+      "actual": 4291,
+      "expected": 4291
+    },
+    "2023-2024:Jharkhand": {
+      "actual": 4345,
+      "expected": 4345
+    },
+    "2023-2024:Karnataka": {
+      "actual": 5946,
+      "expected": 5946
+    },
+    "2023-2024:Kerala": {
+      "actual": 941,
+      "expected": 941
+    },
+    "2023-2024:Ladakh": {
+      "actual": 193,
+      "expected": 193
+    },
+    "2023-2024:Lakshadweep": {
+      "actual": 10,
+      "expected": 10
+    },
+    "2023-2024:Madhya Pradesh": {
+      "actual": 23011,
+      "expected": 23011
+    },
+    "2023-2024:Maharashtra": {
+      "actual": 27894,
+      "expected": 27894
+    },
+    "2023-2024:Manipur": {
+      "actual": 3041,
+      "expected": 3041
+    },
+    "2023-2024:Meghalaya": {
+      "actual": 3069,
+      "expected": 3069
+    },
+    "2023-2024:Mizoram": {
+      "actual": 840,
+      "expected": 840
+    },
+    "2023-2024:Nagaland": {
+      "actual": 1277,
+      "expected": 1277
+    },
+    "2023-2024:Odisha": {
+      "actual": 6794,
+      "expected": 6794
+    },
+    "2023-2024:Puducherry": {
+      "actual": 108,
+      "expected": 108
+    },
+    "2023-2024:Punjab": {
+      "actual": 13233,
+      "expected": 13233
+    },
+    "2023-2024:Rajasthan": {
+      "actual": 11037,
+      "expected": 11037
+    },
+    "2023-2024:Sikkim": {
+      "actual": 199,
+      "expected": 199
+    },
+    "2023-2024:Tamil Nadu": {
+      "actual": 12482,
+      "expected": 12482
+    },
+    "2023-2024:Telangana": {
+      "actual": 12556,
+      "expected": 12556
+    },
+    "2023-2024:The Dadra And Nagar Haveli And Daman And Diu": {
+      "actual": 42,
+      "expected": 42
+    },
+    "2023-2024:Tripura": {
+      "actual": 1176,
+      "expected": 1176
+    },
+    "2023-2024:Uttar Pradesh": {
+      "actual": 57678,
+      "expected": 57678
+    },
+    "2023-2024:Uttarakhand": {
+      "actual": 7766,
+      "expected": 7766
+    },
+    "2023-2024:__india__": {
+      "actual": 259867,
+      "expected": 259867,
+      "reviewed_portal_shortfall": 0
+    }
+  },
+  "block_coverage": {
+    "hierarchy_blocks": 14299
+  },
+  "universe_provenance": {
+    "universe_source_sha256": "1edf5b61cf139f06b0e63ac0a632ea3d727612e43162da502215d7a6983e35bf",
+    "universe_rows_by_year": {
+      "2022-2023": 268114,
+      "2023-2024": 266999
+    }
+  },
+  "unvalidated_state_rows_excluded": {},
+  "score_quality": {
+    "reviewed_null_scores": 38,
+    "score_quality_flag": "source_blank_preserved_as_null"
+  },
+  "coverage": {
+    "2022-2023": {
+      "universe_rows": 268114,
+      "scored_rows": 216256,
+      "unscored_rows": 51858
+    },
+    "2023-2024": {
+      "universe_rows": 266999,
+      "scored_rows": 259867,
+      "unscored_rows": 7132
+    }
+  },
+  "coverage_by_state": {
+    "2022-2023:1": {
+      "state": "Jammu And Kashmir",
+      "universe_rows": 4291,
+      "scored_rows": 4291,
+      "unscored_rows": 0
+    },
+    "2022-2023:10": {
+      "state": "Bihar",
+      "universe_rows": 8054,
+      "scored_rows": 8053,
+      "unscored_rows": 1
+    },
+    "2022-2023:11": {
+      "state": "Sikkim",
+      "universe_rows": 199,
+      "scored_rows": 199,
+      "unscored_rows": 0
+    },
+    "2022-2023:12": {
+      "state": "Arunachal Pradesh",
+      "universe_rows": 2108,
+      "scored_rows": 2108,
+      "unscored_rows": 0
+    },
+    "2022-2023:13": {
+      "state": "Nagaland",
+      "universe_rows": 1288,
+      "scored_rows": 0,
+      "unscored_rows": 1288
+    },
+    "2022-2023:14": {
+      "state": "Manipur",
+      "universe_rows": 3056,
+      "scored_rows": 1976,
+      "unscored_rows": 1080
+    },
+    "2022-2023:15": {
+      "state": "Mizoram",
+      "universe_rows": 841,
+      "scored_rows": 834,
+      "unscored_rows": 7
+    },
+    "2022-2023:16": {
+      "state": "Tripura",
+      "universe_rows": 1176,
+      "scored_rows": 1176,
+      "unscored_rows": 0
+    },
+    "2022-2023:17": {
+      "state": "Meghalaya",
+      "universe_rows": 6859,
+      "scored_rows": 0,
+      "unscored_rows": 6859
+    },
+    "2022-2023:18": {
+      "state": "Assam",
+      "universe_rows": 2619,
+      "scored_rows": 2154,
+      "unscored_rows": 465
+    },
+    "2022-2023:19": {
+      "state": "West Bengal",
+      "universe_rows": 3339,
+      "scored_rows": 0,
+      "unscored_rows": 3339
+    },
+    "2022-2023:2": {
+      "state": "Himachal Pradesh",
+      "universe_rows": 3615,
+      "scored_rows": 3328,
+      "unscored_rows": 287
+    },
+    "2022-2023:20": {
+      "state": "Jharkhand",
+      "universe_rows": 4346,
+      "scored_rows": 4282,
+      "unscored_rows": 64
+    },
+    "2022-2023:21": {
+      "state": "Odisha",
+      "universe_rows": 6794,
+      "scored_rows": 6794,
+      "unscored_rows": 0
+    },
+    "2022-2023:22": {
+      "state": "Chhattisgarh",
+      "universe_rows": 11706,
+      "scored_rows": 11639,
+      "unscored_rows": 67
+    },
+    "2022-2023:23": {
+      "state": "Madhya Pradesh",
+      "universe_rows": 23013,
+      "scored_rows": 23013,
+      "unscored_rows": 0
+    },
+    "2022-2023:24": {
+      "state": "Gujarat",
+      "universe_rows": 14620,
+      "scored_rows": 14619,
+      "unscored_rows": 1
+    },
+    "2022-2023:27": {
+      "state": "Maharashtra",
+      "universe_rows": 27908,
+      "scored_rows": 27655,
+      "unscored_rows": 253
+    },
+    "2022-2023:28": {
+      "state": "Andhra Pradesh",
+      "universe_rows": 13318,
+      "scored_rows": 13310,
+      "unscored_rows": 8
+    },
+    "2022-2023:29": {
+      "state": "Karnataka",
+      "universe_rows": 5951,
+      "scored_rows": 5907,
+      "unscored_rows": 44
+    },
+    "2022-2023:3": {
+      "state": "Punjab",
+      "universe_rows": 13239,
+      "scored_rows": 10514,
+      "unscored_rows": 2725
+    },
+    "2022-2023:30": {
+      "state": "Goa",
+      "universe_rows": 191,
+      "scored_rows": 0,
+      "unscored_rows": 191
+    },
+    "2022-2023:31": {
+      "state": "Lakshadweep",
+      "universe_rows": 10,
+      "scored_rows": 10,
+      "unscored_rows": 0
+    },
+    "2022-2023:32": {
+      "state": "Kerala",
+      "universe_rows": 941,
+      "scored_rows": 941,
+      "unscored_rows": 0
+    },
+    "2022-2023:33": {
+      "state": "Tamil Nadu",
+      "universe_rows": 12525,
+      "scored_rows": 12525,
+      "unscored_rows": 0
+    },
+    "2022-2023:34": {
+      "state": "Puducherry",
+      "universe_rows": 108,
+      "scored_rows": 0,
+      "unscored_rows": 108
+    },
+    "2022-2023:35": {
+      "state": "Andaman And Nicobar Islands",
+      "universe_rows": 70,
+      "scored_rows": 70,
+      "unscored_rows": 0
+    },
+    "2022-2023:36": {
+      "state": "Telangana",
+      "universe_rows": 12768,
+      "scored_rows": 12768,
+      "unscored_rows": 0
+    },
+    "2022-2023:37": {
+      "state": "Ladakh",
+      "universe_rows": 193,
+      "scored_rows": 193,
+      "unscored_rows": 0
+    },
+    "2022-2023:38": {
+      "state": "The Dadra And Nagar Haveli And Daman And Diu",
+      "universe_rows": 38,
+      "scored_rows": 38,
+      "unscored_rows": 0
+    },
+    "2022-2023:5": {
+      "state": "Uttarakhand",
+      "universe_rows": 7795,
+      "scored_rows": 7795,
+      "unscored_rows": 0
+    },
+    "2022-2023:6": {
+      "state": "Haryana",
+      "universe_rows": 6225,
+      "scored_rows": 6223,
+      "unscored_rows": 2
+    },
+    "2022-2023:8": {
+      "state": "Rajasthan",
+      "universe_rows": 11208,
+      "scored_rows": 10634,
+      "unscored_rows": 574
+    },
+    "2022-2023:9": {
+      "state": "Uttar Pradesh",
+      "universe_rows": 57702,
+      "scored_rows": 23207,
+      "unscored_rows": 34495
+    },
+    "2023-2024:1": {
+      "state": "Jammu And Kashmir",
+      "universe_rows": 4291,
+      "scored_rows": 4291,
+      "unscored_rows": 0
+    },
+    "2023-2024:10": {
+      "state": "Bihar",
+      "universe_rows": 8053,
+      "scored_rows": 8053,
+      "unscored_rows": 0
+    },
+    "2023-2024:11": {
+      "state": "Sikkim",
+      "universe_rows": 199,
+      "scored_rows": 199,
+      "unscored_rows": 0
+    },
+    "2023-2024:12": {
+      "state": "Arunachal Pradesh",
+      "universe_rows": 2108,
+      "scored_rows": 2108,
+      "unscored_rows": 0
+    },
+    "2023-2024:13": {
+      "state": "Nagaland",
+      "universe_rows": 1277,
+      "scored_rows": 1277,
+      "unscored_rows": 0
+    },
+    "2023-2024:14": {
+      "state": "Manipur",
+      "universe_rows": 3041,
+      "scored_rows": 3041,
+      "unscored_rows": 0
+    },
+    "2023-2024:15": {
+      "state": "Mizoram",
+      "universe_rows": 840,
+      "scored_rows": 840,
+      "unscored_rows": 0
+    },
+    "2023-2024:16": {
+      "state": "Tripura",
+      "universe_rows": 1176,
+      "scored_rows": 1176,
+      "unscored_rows": 0
+    },
+    "2023-2024:17": {
+      "state": "Meghalaya",
+      "universe_rows": 6859,
+      "scored_rows": 3069,
+      "unscored_rows": 3790
+    },
+    "2023-2024:18": {
+      "state": "Assam",
+      "universe_rows": 2192,
+      "scored_rows": 2192,
+      "unscored_rows": 0
+    },
+    "2023-2024:19": {
+      "state": "West Bengal",
+      "universe_rows": 3339,
+      "scored_rows": 0,
+      "unscored_rows": 3339
+    },
+    "2023-2024:2": {
+      "state": "Himachal Pradesh",
+      "universe_rows": 3615,
+      "scored_rows": 3615,
+      "unscored_rows": 0
+    },
+    "2023-2024:20": {
+      "state": "Jharkhand",
+      "universe_rows": 4345,
+      "scored_rows": 4345,
+      "unscored_rows": 0
+    },
+    "2023-2024:21": {
+      "state": "Odisha",
+      "universe_rows": 6794,
+      "scored_rows": 6794,
+      "unscored_rows": 0
+    },
+    "2023-2024:22": {
+      "state": "Chhattisgarh",
+      "universe_rows": 11643,
+      "scored_rows": 11643,
+      "unscored_rows": 0
+    },
+    "2023-2024:23": {
+      "state": "Madhya Pradesh",
+      "universe_rows": 23011,
+      "scored_rows": 23011,
+      "unscored_rows": 0
+    },
+    "2023-2024:24": {
+      "state": "Gujarat",
+      "universe_rows": 14534,
+      "scored_rows": 14534,
+      "unscored_rows": 0
+    },
+    "2023-2024:27": {
+      "state": "Maharashtra",
+      "universe_rows": 27894,
+      "scored_rows": 27894,
+      "unscored_rows": 0
+    },
+    "2023-2024:28": {
+      "state": "Andhra Pradesh",
+      "universe_rows": 13310,
+      "scored_rows": 13310,
+      "unscored_rows": 0
+    },
+    "2023-2024:29": {
+      "state": "Karnataka",
+      "universe_rows": 5946,
+      "scored_rows": 5946,
+      "unscored_rows": 0
+    },
+    "2023-2024:3": {
+      "state": "Punjab",
+      "universe_rows": 13233,
+      "scored_rows": 13233,
+      "unscored_rows": 0
+    },
+    "2023-2024:30": {
+      "state": "Goa",
+      "universe_rows": 191,
+      "scored_rows": 188,
+      "unscored_rows": 3
+    },
+    "2023-2024:31": {
+      "state": "Lakshadweep",
+      "universe_rows": 10,
+      "scored_rows": 10,
+      "unscored_rows": 0
+    },
+    "2023-2024:32": {
+      "state": "Kerala",
+      "universe_rows": 941,
+      "scored_rows": 941,
+      "unscored_rows": 0
+    },
+    "2023-2024:33": {
+      "state": "Tamil Nadu",
+      "universe_rows": 12482,
+      "scored_rows": 12482,
+      "unscored_rows": 0
+    },
+    "2023-2024:34": {
+      "state": "Puducherry",
+      "universe_rows": 108,
+      "scored_rows": 108,
+      "unscored_rows": 0
+    },
+    "2023-2024:35": {
+      "state": "Andaman And Nicobar Islands",
+      "universe_rows": 70,
+      "scored_rows": 70,
+      "unscored_rows": 0
+    },
+    "2023-2024:36": {
+      "state": "Telangana",
+      "universe_rows": 12556,
+      "scored_rows": 12556,
+      "unscored_rows": 0
+    },
+    "2023-2024:37": {
+      "state": "Ladakh",
+      "universe_rows": 193,
+      "scored_rows": 193,
+      "unscored_rows": 0
+    },
+    "2023-2024:38": {
+      "state": "The Dadra And Nagar Haveli And Daman And Diu",
+      "universe_rows": 42,
+      "scored_rows": 42,
+      "unscored_rows": 0
+    },
+    "2023-2024:5": {
+      "state": "Uttarakhand",
+      "universe_rows": 7766,
+      "scored_rows": 7766,
+      "unscored_rows": 0
+    },
+    "2023-2024:6": {
+      "state": "Haryana",
+      "universe_rows": 6225,
+      "scored_rows": 6225,
+      "unscored_rows": 0
+    },
+    "2023-2024:8": {
+      "state": "Rajasthan",
+      "universe_rows": 11037,
+      "scored_rows": 11037,
+      "unscored_rows": 0
+    },
+    "2023-2024:9": {
+      "state": "Uttar Pradesh",
+      "universe_rows": 57678,
+      "scored_rows": 57678,
+      "unscored_rows": 0
+    }
+  },
+  "score_hierarchy_corrections": [
+    {
+      "year": "2022-2023",
+      "gp_code": "130895",
+      "district_value": "340",
+      "score_state_value": "22",
+      "hierarchy_state_value": "20"
+    },
+    {
+      "year": "2022-2023",
+      "gp_code": "275354",
+      "district_value": "426",
+      "score_state_value": "22",
+      "hierarchy_state_value": "23"
+    },
+    {
+      "year": "2022-2023",
+      "gp_code": "275512",
+      "district_value": "426",
+      "score_state_value": "22",
+      "hierarchy_state_value": "23"
+    },
+    {
+      "year": "2022-2023",
+      "gp_code": "131519",
+      "district_value": "442",
+      "score_state_value": "22",
+      "hierarchy_state_value": "24"
+    }
+  ],
+  "package_bytes": 13382199,
+  "source_collection_manifest_sha256": "3a3b534c7b21e445e51c17cac5a81134165b578c0f153d9d14600a417b79bcfc",
+  "files": {
+    "pai_gp.parquet": {
+      "rows": 535113,
+      "bytes": 13382199,
+      "sha256": "da92576bccc178612e6250c122ac4cf843c190683cf028a5f0d6358620848b1e",
+      "schema": "year: string not null\nstate: string not null\nstate_value: string not null\ndistrict: string not null\ndistrict_value: string not null\nblock: string not null\nblock_value: string not null\ngp_code: string not null\ngp_name: string not null\nhierarchy_source_url: string not null\nhierarchy_retrieved_utc: string not null\nhierarchy_source_sha256: string not null\nscore_available: bool not null\nscorecard_url: string\noverall_pai_score_score: double\nt1_poverty_free_and_enhanced_livelihoods_panchayat_score: double\nt2_healthy_panchayat_score: double\nt3_child_friendly_panchayat_score: double\nt4_water_sufficient_panchayat_score: double\nt5_clean_and_green_panchayat_score: double\nt6_self_sufficient_infrastructure_in_panchayat_score: double\nt7_socially_just_and_socially_secured_panchayat_score: double\nt8_panchayat_with_good_governance_score: double\nt9_women_friendly_panchayat_score: double"
+    }
+  }
+}

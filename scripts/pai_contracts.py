@@ -8,6 +8,7 @@ import math
 import os
 import tempfile
 from collections import Counter, defaultdict
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from functools import cache
@@ -16,9 +17,10 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import pyarrow as pa
-import pyarrow.csv as pacsv
 import pyarrow.parquet as pq
 from pai_common import (
+    BLOCK_TABLE_FIELDS,
+    BLOCK_TABLES,
     CANONICAL_THEME_SLUGS,
     EXPECTED_SCORE_ROWS_PER_GP,
     GP_METADATA_FIELDS,
@@ -30,6 +32,21 @@ from pai_common import (
     WIDE_THEME_FIELDS,
 )
 
+# PAI 1.0 pages omitted LGD codes on some rows; every later vintage must carry
+# the code and scorecard link on every row.
+LEGACY_VINTAGE = "2022-2023"
+
+# A parsed row must always say where it came from; a blank here is a parser bug.
+BLOCK_IDENTITY_FIELDS = (
+    "year",
+    "state",
+    "state_value",
+    "district",
+    "district_value",
+    "block",
+    "block_value",
+    "gp_name",
+)
 INTEGER_FIELDS = {
     "block_page": pa.int32(),
     "theme_order": pa.int8(),
@@ -40,6 +57,9 @@ INTEGER_FIELDS = {
 SCORE_VALUE_EXCEPTIONS = Path(__file__).parent.parent / "config" / "score_value_exceptions.csv"
 GP_SCORE_VECTOR_LINKS = Path(__file__).parent.parent / "config" / "gp_score_vector_links.csv"
 THEME_HEADER_LINKS = Path(__file__).parent.parent / "config" / "theme_header_links.csv"
+OFFICIAL_COUNT_EXCEPTIONS = (
+    Path(__file__).parent.parent / "config" / "official_count_exceptions.csv"
+)
 ScoreValueKey = tuple[str, str, str]
 LegacyIdentityBase = tuple[str, str, str, str, str]
 ScoreSignature = tuple[str, ...]
@@ -65,6 +85,41 @@ def load_score_value_exceptions(
                 raise ValueError(f"{path}: duplicate score exception {key}")
             exceptions[key] = row
     return exceptions
+
+
+def load_official_count_exceptions(
+    path: Path = OFFICIAL_COUNT_EXCEPTIONS,
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """Reviewed cases where the portal displays fewer GPs than the Ministry's table."""
+    exceptions: dict[tuple[str, str], dict[str, Any]] = {}
+    if not path.exists():
+        return exceptions
+    with path.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            if not row.get("evidence", "").strip():
+                raise ValueError(f"{path}: every official-count exception requires evidence")
+            official = int(row["official_count"])
+            portal = int(row["portal_count"])
+            if not 0 <= portal < official:
+                raise ValueError(f"{path}: portal count must be below the official count")
+            exceptions[(row["year"], row["state"])] = {
+                "official_count": official,
+                "portal_count": portal,
+                "evidence": row["evidence"].strip(),
+            }
+    return exceptions
+
+
+def expected_state_count(
+    year: str, state: str, controls: Mapping[str, int], exceptions: Mapping[tuple[str, str], Any]
+) -> tuple[int, dict[str, Any] | None]:
+    """The count a collection must reproduce for a state, and the reviewed exception if any."""
+    exception = exceptions.get((year, state))
+    if exception is None:
+        return controls[state], None
+    if exception["official_count"] != controls[state]:
+        raise AssertionError(f"{year} {state}: exception official count differs from controls")
+    return exception["portal_count"], exception
 
 
 @cache
@@ -156,7 +211,9 @@ def canonicalize_parsed_themes(parsed: dict[str, Any]) -> dict[str, Any]:
 
 
 def _canonical_score(value: Any) -> str:
-    text = str(value or "").strip()
+    if value is None:
+        return ""
+    text = str(value).strip()
     if not text:
         return ""
     try:
@@ -338,46 +395,20 @@ def typed_schema(fields: list[str], kind: str) -> pa.Schema:
     )
 
 
-def csv_to_typed_parquet(src: Path, dst: Path, kind: str, *, block_size: int = 1 << 20) -> Path:
-    """Stream a compatibility CSV to typed Parquet and verify the written file."""
-    with src.open(newline="", encoding="utf-8") as handle:
-        fields = next(csv.reader(handle), [])
-    if not fields:
-        raise ValueError(f"{src}: missing header")
-
+def rows_to_table(rows: list[dict[str, Any]], fields: list[str], kind: str) -> pa.Table:
+    """Coerce dict rows onto the declared typed schema; a non-numeric score raises."""
     schema = typed_schema(fields, kind)
-    reader = pacsv.open_csv(
-        src,
-        read_options=pacsv.ReadOptions(block_size=block_size),
-        convert_options=pacsv.ConvertOptions(
-            column_types={field.name: field.type for field in schema},
-            strings_can_be_null=False,
-        ),
-    )
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
-    os.close(fd)
-    tmp = Path(tmp_name)
-    rows = 0
-    try:
-        with pq.ParquetWriter(tmp, schema, compression="zstd", compression_level=7) as writer:
-            for batch in reader:
-                if batch.schema != schema:
-                    batch = batch.cast(schema)
-                writer.write_batch(batch)
-                rows += batch.num_rows
-        restored = pq.ParquetFile(tmp)
-        if restored.schema_arrow != schema:
-            raise AssertionError(
-                f"{dst}: schema round trip failed: {restored.schema_arrow} != {schema}"
-            )
-        if restored.metadata.num_rows != rows:
-            raise AssertionError(f"{dst}: row count changed during Parquet write")
-        tmp.replace(dst)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
-    return dst
+    normalized = []
+    for row in rows:
+        typed: dict[str, Any] = {}
+        for field in fields:
+            dtype = schema.field(field).type
+            try:
+                typed[field] = _coerce(row.get(field), dtype)
+            except (TypeError, ValueError) as exc:
+                raise AssertionError(f"{field} is not {dtype}: {row.get(field)!r}") from exc
+        normalized.append(typed)
+    return pa.Table.from_pylist(normalized, schema=schema)
 
 
 def rows_to_typed_parquet(
@@ -385,11 +416,7 @@ def rows_to_typed_parquet(
 ) -> pa.Table:
     """Write in-memory rows to typed Parquet, with an atomic read-back check."""
     schema = typed_schema(fields, kind)
-    normalized = [
-        {field: _coerce(row.get(field), schema.field(field).type) for field in fields}
-        for row in rows
-    ]
-    table = pa.Table.from_pylist(normalized, schema=schema)
+    table = rows_to_table(rows, fields, kind)
     dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{dst.name}.", suffix=".tmp", dir=dst.parent)
     os.close(fd)
@@ -407,13 +434,29 @@ def rows_to_typed_parquet(
 
 
 def _coerce(value: Any, dtype: pa.DataType) -> Any:
-    if value in (None, ""):
+    if value is None or (isinstance(value, str) and value == ""):
         return None if not pa.types.is_string(dtype) else ""
     if pa.types.is_integer(dtype):
         return int(value)
     if pa.types.is_floating(dtype):
         return float(value)
     return str(value)
+
+
+def write_block_tables(
+    block_dir: Path,
+    metadata: list[dict[str, Any]],
+    scores: list[dict[str, Any]],
+    wide: list[dict[str, Any]],
+) -> dict[str, Path]:
+    """Persist one block's three tables as typed Parquet and return their paths."""
+    tables = {"metadata": metadata, "scores": scores, "wide": wide}
+    written: dict[str, Path] = {}
+    for kind, rows in tables.items():
+        dst = block_dir / BLOCK_TABLES[kind]
+        rows_to_typed_parquet(rows, list(BLOCK_TABLE_FIELDS[kind]), dst, kind)
+        written[kind] = dst
+    return written
 
 
 def scorecard_gp_code(scorecard_url: str) -> str:
@@ -480,7 +523,10 @@ def validate_block_rows(
         missing = set(GP_METADATA_FIELDS) - set(row)
         if missing:
             raise AssertionError(f"metadata schema missing fields: {sorted(missing)}")
-        if require_current_pai2_identity and row.get("year") == "2023-2024":
+        blank = [field for field in BLOCK_IDENTITY_FIELDS if not str(row.get(field) or "").strip()]
+        if blank:
+            raise AssertionError(f"metadata row has blank identity fields: {blank}")
+        if require_current_pai2_identity and row.get("year") != LEGACY_VINTAGE:
             if not str(row.get("gp_code") or "").strip():
                 raise AssertionError("PAI 2.0 row is missing its GP LGD code")
             if not str(row.get("scorecard_url") or "").strip():
@@ -578,7 +624,7 @@ def validate_global_tables(
                 raise AssertionError(f"duplicate GP-year key in metadata: {key}")
             meta_keys.add(key)
             state_counts[(str(row["year"]), str(row["state"]))] += 1
-            if require_current_pai2_identity and row.get("year") == "2023-2024":
+            if require_current_pai2_identity and row.get("year") != LEGACY_VINTAGE:
                 if not str(row.get("gp_code") or "").strip():
                     raise AssertionError("PAI 2.0 row is missing its GP LGD code")
                 if not str(row.get("scorecard_url") or "").strip():
@@ -687,36 +733,57 @@ def validate_global_tables(
             )
         checked[f"{year}:{state}"] = {"actual": actual, "expected": expected}
     if require_national:
-        year = "2023-2024"
-        controls = OFFICIAL_FINAL_GP_COUNTS[year]
-        expected_states = {state for state in controls if not state.startswith("__")}
-        actual_states = {state for observed_year, state in state_counts if observed_year == year}
-        if actual_states != expected_states:
+        present_years = {observed_year for observed_year, _ in state_counts}
+        for year, controls in OFFICIAL_FINAL_GP_COUNTS.items():
+            if year not in present_years:
+                continue
+            expected_states = {state for state in controls if not state.startswith("__")}
+            actual_states = {
+                state for observed_year, state in state_counts if observed_year == year
+            }
             missing_states = sorted(expected_states - actual_states)
-            extra_states = sorted(actual_states - expected_states)
-            raise AssertionError(
-                f"national state universe failed: missing={missing_states}, "
-                f"unexpected={extra_states}"
-            )
-        for state in sorted(expected_states):
-            actual = state_counts[(year, state)]
-            expected = controls[state]
-            if actual != expected:
+            if missing_states:
                 raise AssertionError(
-                    f"official GP count failed for {state} {year}: {actual} != {expected}"
+                    f"national state universe failed for {year}: missing={missing_states}"
                 )
-            checked[f"{year}:{state}"] = {"actual": actual, "expected": expected}
-        national_actual = sum(
-            count for (observed_year, _), count in state_counts.items() if observed_year == year
-        )
-        if national_actual != controls["__india__"]:
-            raise AssertionError(
-                f"official India GP count failed: {national_actual} != {controls['__india__']}"
+            # Rows the portal displays for a state the Ministry did not validate are
+            # kept in the collection and counted here; the release package drops them.
+            for state in sorted(actual_states - expected_states):
+                checked[f"{year}:{state}"] = {
+                    "actual": state_counts[(year, state)],
+                    "expected": 0,
+                    "status": "unvalidated_state_rows",
+                }
+            count_exceptions = load_official_count_exceptions()
+            shortfall = 0
+            for state in sorted(expected_states):
+                actual = state_counts[(year, state)]
+                expected, exception = expected_state_count(year, state, controls, count_exceptions)
+                if actual != expected:
+                    raise AssertionError(
+                        f"official GP count failed for {state} {year}: {actual} != {expected}"
+                    )
+                entry: dict[str, Any] = {"actual": actual, "expected": controls[state]}
+                if exception is not None:
+                    entry["reviewed_portal_count"] = expected
+                    entry["evidence"] = exception["evidence"]
+                    shortfall += controls[state] - expected
+                checked[f"{year}:{state}"] = entry
+            national_actual = sum(
+                count
+                for (observed_year, state), count in state_counts.items()
+                if observed_year == year and state in expected_states
             )
-        checked[f"{year}:__india__"] = {
-            "actual": national_actual,
-            "expected": controls["__india__"],
-        }
+            if national_actual != controls["__india__"] - shortfall:
+                raise AssertionError(
+                    f"official India GP count failed for {year}: "
+                    f"{national_actual} != {controls['__india__']} - {shortfall}"
+                )
+            checked[f"{year}:__india__"] = {
+                "actual": national_actual,
+                "expected": controls["__india__"],
+                "reviewed_portal_shortfall": shortfall,
+            }
     return {**counts, "official_counts_checked": checked}
 
 

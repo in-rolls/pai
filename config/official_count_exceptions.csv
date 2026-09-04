@@ -1,0 +1,2 @@
+year,state,official_count,portal_count,evidence
+2022-2023,Assam,2183,2154,"PIB PRID 2120320 (9 Apr 2025) lists 2183 Assam GPs with validated PAI 2022-23 data; the portal's block tables display 2154 in two independent double retrievals (June 2026 and 5 Sep 2026, identical per block). The 29 undisplayed GPs fall in six subset blocks (Gobardhana 6/20, Narayanpur 7/14, Binakandi 20/24, Amguri 9/10, Chamaria 14/15, Chhaygaon Maa Chandika 6/7) and Karbi Anglong/Chirang no-data blocks; block_count_audit.csv records the missing LGD codes."

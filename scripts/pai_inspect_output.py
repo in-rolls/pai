@@ -24,8 +24,9 @@ def main() -> None:
     out = Path(args.out)
     store = BlockStore(out)
     manifest = read_global(out, "block_manifest")
-    metadata = read_global(out, "gp_metadata")
-    scores = read_global(out, "gp_scores_long")
+    # The rebuild writes the analysis tables under derived/; the logs stay at the root.
+    metadata = read_global(out / "derived", "gp_metadata")
+    scores = read_global(out / "derived", "gp_scores_long")
     inventory = read_global(out, "dropdown_inventory")
 
     print(f"Output dir: {out.resolve()}")

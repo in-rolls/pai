@@ -2,9 +2,8 @@
 """Tabulate PAI scrape coverage: data volume + year-wise and state-wise distribution.
 
 Computes everything from the on-disk per-block files (DONE.json / FAILED.json and each
-block's data_wide.csv), which are the authoritative current state. This matches exactly
-what scripts/build_release.py packages (both rebuild the dataset from per-block files,
-not from the append-only global CSVs, which can carry duplicate multi-run rows).
+block's data_wide.parquet), which are the authoritative current state, not from the
+append-only manifest, which can carry duplicate multi-run rows.
 
 Outputs (also printed as GitHub-flavored Markdown):
     <out>/pai_summary.csv           one row per year (totals + on-disk sizes)
@@ -22,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from pai_common import (  # noqa: E402
-    DATA_WIDE_CSV,
+    BLOCK_TABLES,
     DONE_JSON,
     FAILED_JSON,
     MANIFEST_FAILED,
@@ -53,17 +52,14 @@ def _new_state() -> dict[str, float]:
     }
 
 
-def sum_overall(rows: list[dict[str, str]]) -> tuple[float, int]:
-    """Return (sum, n) of the overall PAI score column in a per-block data_wide.csv."""
+def sum_overall(rows: list[dict[str, object]]) -> tuple[float, int]:
+    """Return (sum, n) of the overall PAI score column of a per-block wide table."""
     total, n = 0.0, 0
     for row in rows:
-        v = row.get(OVERALL_COL, "")
-        if v:
-            try:
-                total += float(v)
-                n += 1
-            except ValueError:
-                pass
+        v = row.get(OVERALL_COL)
+        if v is not None:
+            total += float(v)  # type: ignore[arg-type]
+            n += 1
     return total, n
 
 
@@ -78,7 +74,8 @@ def walk_year(store: BlockStore, year: str) -> tuple[dict[str, dict], set, int, 
     districts: set[tuple[str, str]] = set()
     data_bytes, html_bytes = store.sizes(year)
 
-    for blk in store.iter_blocks(year, names={DONE_JSON, FAILED_JSON, DATA_WIDE_CSV}):
+    wide_table = BLOCK_TABLES["wide"]
+    for blk in store.iter_blocks(year, names={DONE_JSON, FAILED_JSON, wide_table}):
         d = None
         for name in (DONE_JSON, FAILED_JSON):
             if blk.exists(name):
@@ -96,7 +93,7 @@ def walk_year(store: BlockStore, year: str) -> tuple[dict[str, dict], set, int, 
             ps["with_data"] += 1
             ps["gp_count"] += int(d.get("gp_rows", 0) or 0)
             ps["score_rows"] += int(d.get("score_rows", 0) or 0)
-            s, n = sum_overall(blk.rows(DATA_WIDE_CSV))
+            s, n = sum_overall(blk.rows(wide_table))
             ps["overall_sum"] += s
             ps["overall_n"] += n
         elif status in STATUS_NO_DATA:

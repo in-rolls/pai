@@ -139,6 +139,17 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def check_exclusion_source(exclusion: Mapping[str, str], provenance: Mapping[str, object]) -> None:
+    """A reviewed exclusion is evidence about one response; a changed response needs new review."""
+    if str(provenance.get("sha256")) != exclusion["source_sha256"]:
+        raise ValueError(
+            "hierarchy exclusion for district "
+            f"{exclusion['district_value']} was reviewed against response "
+            f"{exclusion['source_sha256'][:12]}, but the district list now hashes to "
+            f"{str(provenance.get('sha256'))[:12]}; re-review before excluding"
+        )
+
+
 def load_hierarchy_exclusions(path: Path) -> dict[HierarchyKey, dict[str, str]]:
     """Load reviewed district placements that the portal assigns to the wrong state."""
     exclusions: dict[HierarchyKey, dict[str, str]] = {}
@@ -552,6 +563,9 @@ def collect_universe(
             for district in districts:
                 exclusion_key = (year, state["value"], district["value"])
                 if exclusion_key in hierarchy_exclusions:
+                    check_exclusion_source(
+                        hierarchy_exclusions[exclusion_key], district_response.provenance
+                    )
                     applied_exclusions.append(
                         {
                             **dict(hierarchy_exclusions[exclusion_key]),

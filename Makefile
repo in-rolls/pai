@@ -21,7 +21,7 @@ test:                ## Run the test suite
 check: lint test     ## Lint + test
 
 data-package:        ## Build the committed universe-left package from a validated derived bundle
-	uv run scripts/build_data_package.py --derived-dir $(DERIVED) --out $(DATA_RELEASE)
+	uv run scripts/build_data_package.py --derived-dir $(DERIVED) --out $(DATA_RELEASE) --universe-dir runs/pai_universe
 
 verify-data:         ## Verify the committed package schemas, keys, counts, and checksums
 	uv run scripts/verify_data_package.py --data-dir $(DATA_RELEASE)
@@ -29,7 +29,7 @@ verify-data:         ## Verify the committed package schemas, keys, counts, and 
 release-check: check verify-data ## Preflight a tag without creating it: make release-check VERSION=0.1.0
 	uv run scripts/release_check.py $(VERSION)
 
-verify:              ## Prove the derived global CSVs are rebuildable from the per-block files
+verify:              ## Check archives against their manifests and re-run every block contract
 	uv run scripts/pai_compact.py verify
 
 compact:             ## Archive the data tree with zstd and drop what verify proved redundant

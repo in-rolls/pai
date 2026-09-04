@@ -224,3 +224,6 @@ __marimo__/
 
 # Release build outputs (published to Dataverse, not committed)
 /dist
+
+# independent-review tools drop their diff dumps in the repo root
+/*.patch

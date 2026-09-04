@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pai_collect_universe import HIERARCHY_EXCLUSIONS, load_hierarchy_exclusions
 from pai_common import (
@@ -23,7 +24,12 @@ from pai_common import (
     OFFICIAL_FINAL_GP_COUNTS,
     YEAR_CONFIGS,
 )
-from pai_contracts import load_score_value_exceptions, typed_schema
+from pai_contracts import (
+    expected_state_count,
+    load_official_count_exceptions,
+    load_score_value_exceptions,
+    typed_schema,
+)
 
 ROOT = Path(__file__).parent.parent
 SCORE_ID_FIELDS = [
@@ -242,8 +248,37 @@ def state_coverage_audit(table: pa.Table) -> dict[str, dict[str, int | str]]:
     return dict(sorted(counts.items()))
 
 
-def validate_release_coverage(table: pa.Table) -> dict[str, dict[str, int]]:
-    """Require every published vintage and the official PAI 2.0 totals."""
+def drop_unvalidated_state_rows(scores: pa.Table) -> tuple[pa.Table, dict[str, int]]:
+    """Remove score rows from states the Ministry did not validate for that vintage.
+
+    The portal can display scores for such a state (Meghalaya in 2022-23); they
+    were never part of the official index, so the release treats those GPs as
+    unscored and records how many rows it set aside.
+    """
+    years = scores.column("year").to_pylist()
+    states = scores.column("state").to_pylist()
+    keep = []
+    dropped: dict[str, int] = {}
+    for year, state in zip(years, states, strict=True):
+        controls = OFFICIAL_FINAL_GP_COUNTS.get(year)
+        unvalidated = bool(controls) and state not in controls
+        keep.append(not unvalidated)
+        if unvalidated:
+            dropped[f"{year}:{state}"] = dropped.get(f"{year}:{state}", 0) + 1
+    return scores.filter(pa.array(keep)), dropped
+
+
+def validate_release_coverage(
+    table: pa.Table,
+    hierarchy_corrections: list[dict[str, str]] | None = None,
+    state_names: dict[str, str] | None = None,
+) -> dict[str, dict[str, int]]:
+    """Require every published vintage and the official totals of each controlled vintage.
+
+    The Ministry counts a GP under the state the portal's score table shows. The
+    release table carries the LGD hierarchy's state instead, so when verifying the
+    release the reviewed corrections recorded in its manifest are folded back.
+    """
     years = {str(value) for value in table.column("year").to_pylist()}
     required = set(REQUIRED_RELEASE_YEARS)
     if years != required:
@@ -258,7 +293,21 @@ def validate_release_coverage(table: pa.Table) -> dict[str, dict[str, int]]:
             strict=True,
         )
     )
-    checked: dict[str, dict[str, int]] = {}
+    if hierarchy_corrections:
+        if state_names is None:
+            state_names = dict(
+                zip(
+                    table.column("state_value").to_pylist(),
+                    table.column("state").to_pylist(),
+                    strict=True,
+                )
+            )
+        for correction in hierarchy_corrections:
+            year = str(correction["year"])
+            counts[(year, state_names[str(correction["hierarchy_state_value"])])] -= 1
+            counts[(year, state_names[str(correction["score_state_value"])])] += 1
+    checked: dict[str, dict[str, Any]] = {}
+    count_exceptions = load_official_count_exceptions()
     for year, controls in OFFICIAL_FINAL_GP_COUNTS.items():
         expected_states = {state for state in controls if not state.startswith("__")}
         actual_states = {state for observed_year, state in counts if observed_year == year}
@@ -268,25 +317,32 @@ def validate_release_coverage(table: pa.Table) -> dict[str, dict[str, int]]:
                 f"missing={sorted(expected_states - actual_states)}, "
                 f"unexpected={sorted(actual_states - expected_states)}"
             )
+        shortfall = 0
         for state in sorted(expected_states):
             actual = counts[(year, state)]
-            expected = controls[state]
+            expected, exception = expected_state_count(year, state, controls, count_exceptions)
             if actual != expected:
                 raise AssertionError(
                     f"official GP count failed for {state} {year}: {actual} != {expected}"
                 )
-            checked[f"{year}:{state}"] = {"actual": actual, "expected": expected}
+            entry: dict[str, Any] = {"actual": actual, "expected": controls[state]}
+            if exception is not None:
+                entry["reviewed_portal_count"] = expected
+                entry["evidence"] = exception["evidence"]
+                shortfall += controls[state] - expected
+            checked[f"{year}:{state}"] = entry
         actual_india = sum(
             count for (observed_year, _), count in counts.items() if observed_year == year
         )
-        expected_india = controls["__india__"]
+        expected_india = controls["__india__"] - shortfall
         if actual_india != expected_india:
             raise AssertionError(
                 f"official India GP count failed for {year}: {actual_india} != {expected_india}"
             )
         checked[f"{year}:__india__"] = {
             "actual": actual_india,
-            "expected": expected_india,
+            "expected": controls["__india__"],
+            "reviewed_portal_shortfall": shortfall,
         }
     return checked
 
@@ -319,12 +375,107 @@ def validate_score_values(table: pa.Table) -> dict[str, Any]:
     }
 
 
+SUCCESSFUL_BLOCK_STATUSES = {
+    "done",
+    "done_no_data_available",
+    "done_no_rows",
+    "skipped_done",
+    "skipped_no_data",
+}
+
+
+def validate_block_coverage(universe: pa.Table, manifest: pa.Table) -> dict[str, int]:
+    """Every hierarchy block must have a successful collection outcome.
+
+    Without this, a block that failed or was never scraped has no score rows and
+    its GPs would be published as portal nonpublication rather than as a gap.
+    """
+    key_fields = ["year", "state_value", "district_value", "block_value"]
+    universe_blocks = {tuple(row.values()) for row in universe.select(key_fields).to_pylist()}
+    latest = {
+        tuple(str(row[field]) for field in key_fields): str(row["status"])
+        for row in manifest.select([*key_fields, "status"]).to_pylist()
+    }
+    uncollected = sorted(
+        block for block in universe_blocks if latest.get(block) not in SUCCESSFUL_BLOCK_STATUSES
+    )
+    if uncollected:
+        raise AssertionError(
+            f"{len(uncollected)} hierarchy block(s) lack a successful collection outcome; "
+            f"first: {uncollected[:5]}"
+        )
+    return {"hierarchy_blocks": len(universe_blocks)}
+
+
+def validate_universe_provenance(derived_dir: Path, universe_dir: Path) -> dict[str, Any]:
+    """The release denominator must be the independent nationwide hierarchy crawl.
+
+    A derived bundle whose universe came from cached blocks can silently omit
+    whole unscored branches, and no score-count control would notice. So the
+    derived manifest must carry the crawl's checksum, that checksum must match
+    the crawl's own manifest, and the derived universe must hold exactly the
+    crawl's per-vintage row counts.
+    """
+    derived_manifest = json.loads((derived_dir / "collection_manifest.json").read_text("utf-8"))
+    declared_sha = derived_manifest.get("contracts", {}).get("universe_source_sha256")
+    if not declared_sha:
+        raise AssertionError(
+            "derived bundle was not built from the independent universe crawl "
+            "(no universe_source_sha256 in its collection manifest)"
+        )
+    crawl_manifest = json.loads((universe_dir / "collection_manifest.json").read_text("utf-8"))
+    crawl_sha = crawl_manifest["parquet"]["sha256"]
+    if declared_sha != crawl_sha:
+        raise AssertionError("derived bundle was built from a different universe crawl")
+    universe = pq.read_table(derived_dir / "gp_universe.parquet", columns=["year", "state"])
+    per_year = {
+        str(item["values"]): int(item["counts"])
+        for item in pc.value_counts(universe.column("year")).to_pylist()
+    }
+    states_by_year: dict[str, set[str]] = {}
+    for year, state in zip(
+        universe.column("year").to_pylist(), universe.column("state").to_pylist(), strict=True
+    ):
+        states_by_year.setdefault(str(year), set()).add(str(state))
+    checked: dict[str, int] = {}
+    for year in REQUIRED_RELEASE_YEARS:
+        if year not in crawl_manifest.get("counts_by_year", {}):
+            raise AssertionError(f"release vintages differ: the universe crawl has no {year}")
+        expected = int(crawl_manifest["counts_by_year"][year]["parquet_rows"])
+        if per_year.get(year, 0) != expected:
+            raise AssertionError(
+                f"derived universe holds {per_year.get(year, 0)} rows for {year}; "
+                f"the crawl recorded {expected}"
+            )
+        # Nationwide scope: a crawl restricted to some states is self-consistent, so
+        # require every controlled state and every officially unscored state.
+        controls = OFFICIAL_FINAL_GP_COUNTS.get(year, {})
+        required = {state for state in controls if not state.startswith("__")}
+        required |= {
+            str(entry["name"])
+            for entry in crawl_manifest.get("states_without_published_score_control", {}).get(
+                year, []
+            )
+        }
+        missing = sorted(required - states_by_year.get(year, set()))
+        if missing:
+            raise AssertionError(f"universe crawl for {year} is not nationwide: missing {missing}")
+        inventory = int(crawl_manifest["counts_by_year"][year].get("states", len(required)))
+        if inventory != len(required):
+            raise AssertionError(
+                f"universe crawl for {year} lists {inventory} states; "
+                f"controls and unscored states account for {len(required)}"
+            )
+        checked[year] = expected
+    return {"universe_source_sha256": crawl_sha, "universe_rows_by_year": checked}
+
+
 def validate_source_manifest(derived_dir: Path) -> dict[str, Any]:
     """Bind the package inputs to the audited derived collection manifest."""
     path = derived_dir / "collection_manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
     declared = manifest.get("derived", {})
-    for filename in ("gp_scores_wide.parquet", "gp_universe.parquet"):
+    for filename in ("gp_scores_wide.parquet", "gp_universe.parquet", "block_manifest.parquet"):
         source = derived_dir / filename
         actual = {
             "rows": pq.read_metadata(source).num_rows,
@@ -363,22 +514,26 @@ def validate_git_sizes(files: dict[str, dict[str, Any]]) -> int:
     return sum(int(entry["bytes"]) for entry in files.values())
 
 
-def build(derived_dir: Path, out: Path) -> dict[str, Any]:
+def build(derived_dir: Path, out: Path, universe_dir: Path | None = None) -> dict[str, Any]:
     """Create and atomically promote a checked universe-left public data package."""
+    universe_dir = universe_dir if universe_dir is not None else ROOT / "runs" / "pai_universe"
     source_manifest = derived_dir / "collection_manifest.json"
     scores_source = derived_dir / "gp_scores_wide.parquet"
     universe_source = derived_dir / "gp_universe.parquet"
-    for required in (source_manifest, scores_source, universe_source):
+    blocks_source = derived_dir / "block_manifest.parquet"
+    for required in (source_manifest, scores_source, universe_source, blocks_source):
         if not required.exists():
             raise FileNotFoundError(required)
     validate_source_manifest(derived_dir)
+    universe_provenance = validate_universe_provenance(derived_dir, universe_dir)
 
     out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{out.name}.staging-", dir=out.parent) as name:
         stage = Path(name)
         public_path = stage / "pai_gp.parquet"
-        scores = project_scores(scores_source)
+        scores, unvalidated_state_rows = drop_unvalidated_state_rows(project_scores(scores_source))
         universe = read_universe(universe_source)
+        block_coverage = validate_block_coverage(universe, pq.read_table(blocks_source))
         official_counts_checked = validate_release_coverage(scores)
         score_quality = validate_score_values(scores)
         public, hierarchy_corrections = build_public_table(
@@ -395,6 +550,9 @@ def build(derived_dir: Path, out: Path) -> dict[str, Any]:
             "key": ["year", "gp_code"],
             "years": list(REQUIRED_RELEASE_YEARS),
             "official_counts_checked": official_counts_checked,
+            "block_coverage": block_coverage,
+            "universe_provenance": universe_provenance,
+            "unvalidated_state_rows_excluded": unvalidated_state_rows,
             "score_quality": score_quality,
             "coverage": coverage_audit(public),
             "coverage_by_state": state_coverage_audit(public),
@@ -430,8 +588,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--derived-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, default=ROOT / "data" / "release")
+    parser.add_argument(
+        "--universe-dir",
+        type=Path,
+        default=ROOT / "runs" / "pai_universe",
+        help="Independent hierarchy crawl the derived bundle must have been built from",
+    )
     args = parser.parse_args()
-    manifest = build(args.derived_dir, args.out)
+    manifest = build(args.derived_dir, args.out, args.universe_dir)
     print(
         f"Wrote {sum(item['rows'] for item in manifest['files'].values()):,} table rows "
         f"to {args.out}"

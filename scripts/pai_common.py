@@ -1,6 +1,6 @@
 """Shared constants and helpers for the PAI scraper and data tools.
 
-Single source of truth for CSV schemas, per-year page config, block-status
+Single source of truth for table schemas, per-year page config, block-status
 buckets, theme column names, and the small CSV/JSON + per-block-tree utilities
 that the scraper, index rebuilder, summariser, and packager all need.
 """
@@ -8,12 +8,10 @@ that the scraper, index rebuilder, summariser, and packager all need.
 import csv
 import json
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from pai_stores import BlockStore  # noqa: E402
+from filelock import FileLock
 
 # --------------------------------------------------------------------------- #
 # Per-year page configuration
@@ -38,7 +36,42 @@ YEAR_CONFIGS: dict[str, dict[str, str]] = {
 YEARS: list[str] = list(YEAR_CONFIGS)
 
 EXPECTED_SCORE_ROWS_PER_GP = 10
+# Official scored-GP totals per vintage, transcribed from the Ministry's published
+# state tables (sources below). PAI 1.0: PIB 2120320 (9 Apr 2025), "No of GPs
+# Submitted Data" column; five States/UTs were excluded pending validation.
 OFFICIAL_FINAL_GP_COUNTS: dict[str, dict[str, int]] = {
+    "2022-2023": {
+        "Andaman And Nicobar Islands": 70,
+        "Andhra Pradesh": 13_310,
+        "Arunachal Pradesh": 2_108,
+        "Assam": 2_183,
+        "Bihar": 8_053,
+        "Chhattisgarh": 11_643,
+        "Gujarat": 14_618,
+        "Haryana": 6_223,
+        "Himachal Pradesh": 3_328,
+        "Jammu And Kashmir": 4_291,
+        "Jharkhand": 4_281,
+        "Karnataka": 5_907,
+        "Kerala": 941,
+        "Ladakh": 193,
+        "Lakshadweep": 10,
+        "Madhya Pradesh": 23_011,
+        "Maharashtra": 27_655,
+        "Manipur": 1_976,
+        "Mizoram": 834,
+        "Odisha": 6_794,
+        "Punjab": 10_514,
+        "Rajasthan": 10_634,
+        "Sikkim": 199,
+        "Tamil Nadu": 12_525,
+        "Telangana": 12_768,
+        "The Dadra And Nagar Haveli And Daman And Diu": 38,
+        "Tripura": 1_176,
+        "Uttar Pradesh": 23_207,
+        "Uttarakhand": 7_795,
+        "__india__": 216_285,
+    },
     "2023-2024": {
         "Andaman And Nicobar Islands": 70,
         "Andhra Pradesh": 13_310,
@@ -74,11 +107,12 @@ OFFICIAL_FINAL_GP_COUNTS: dict[str, dict[str, int]] = {
         "Tripura": 1_176,
         "Uttarakhand": 7_766,
         "__india__": 259_867,
-    }
+    },
 }
-OFFICIAL_FINAL_GP_COUNTS_SOURCE = (
-    "https://www.pib.gov.in/PressReleasePage.aspx?PRID=2294288&lang=1&reg=6"
-)
+OFFICIAL_FINAL_GP_COUNTS_SOURCE: dict[str, str] = {
+    "2022-2023": "https://www.pib.gov.in/PressReleasePage.aspx?PRID=2120320",
+    "2023-2024": "https://www.pib.gov.in/PressReleasePage.aspx?PRID=2294288&lang=1&reg=6",
+}
 
 # Results paginate 100 GPs per "Next 100 >>" click. The flat page never marks
 # #btnNext disabled, so a short page (< 100 rows) signals the last page.
@@ -129,7 +163,7 @@ MANIFEST_NO_DATA = {"done_no_data_available", "done_no_rows", "skipped_no_data"}
 MANIFEST_FAILED = {"failed", "state_page_load_failed", "year_page_load_failed", "year_crashed"}
 
 # --------------------------------------------------------------------------- #
-# CSV schemas (header/field order for the consolidated outputs)
+# Table schemas (field order for the per-block Parquet tables and the logs)
 # --------------------------------------------------------------------------- #
 BLOCK_MANIFEST_FIELDS = [
     "run_id",
@@ -143,9 +177,9 @@ BLOCK_MANIFEST_FIELDS = [
     "block",
     "block_value",
     "block_dir",
-    "data_wide_csv",
-    "metadata_csv",
-    "scores_long_csv",
+    "metadata_file",
+    "scores_file",
+    "wide_file",
     "html_pages",
     "gp_rows",
     "score_rows",
@@ -186,7 +220,6 @@ GP_METADATA_FIELDS = [
     "details_raw",
     "block_page",
     "block_dir",
-    "block_data_wide_csv",
     "block_html_file",
     "source_url",
 ]
@@ -216,12 +249,21 @@ GP_UNIVERSE_FIELDS = [
     "source_sha256",
 ]
 
-# Per-block file names.
+# Per-block file names. The three tables are typed Parquet written by
+# pai_contracts.write_block_tables; they are the parsed cache that the rendered
+# HTML cannot replace without a browser.
 DONE_JSON = "DONE.json"
 FAILED_JSON = "FAILED.json"
-DATA_WIDE_CSV = "data_wide.csv"
-METADATA_CSV = "metadata.csv"
-SCORES_LONG_CSV = "scores_long.csv"
+BLOCK_TABLES = {
+    "metadata": "metadata.parquet",
+    "scores": "scores_long.parquet",
+    "wide": "data_wide.parquet",
+}
+BLOCK_TABLE_FIELDS = {
+    "metadata": GP_METADATA_FIELDS,
+    "scores": GP_SCORE_FIELDS,
+    "wide": [*GP_METADATA_FIELDS, *WIDE_THEME_FIELDS],
+}
 
 csv.field_size_limit(10_000_000)
 
@@ -242,10 +284,12 @@ def append_csv_rows(path: Path, rows: list[dict[str, Any]], fieldnames: list[str
     if not rows:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as f:
+    # Several scraper workers (split by state) append to the same provenance logs.
+    # The file is opened only once the lock is held, so the header check sees
+    # whatever the previous holder wrote.
+    with FileLock(f"{path}.lock"), path.open("a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        if not exists:
+        if f.tell() == 0:
             writer.writeheader()
         writer.writerows(rows)
 
@@ -274,9 +318,18 @@ def read_json(path: Path) -> dict[str, Any]:
 
 
 def write_json(path: Path, obj: dict[str, Any]) -> None:
-    """Write a JSON object to disk (UTF-8, indented, non-ASCII preserved)."""
+    """Write a JSON object atomically (UTF-8, indented, non-ASCII preserved).
+
+    DONE.json is the resumability checkpoint; a process killed mid-write must
+    leave the previous file, not a truncated one.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -292,58 +345,3 @@ def read_block_status(block_dir: Path) -> dict[str, Any] | None:
             except Exception:
                 return {"status": "done_unreadable_json"}
     return None
-
-
-def consolidate_per_block(
-    data_dir: Path, fname: str, dst: Path, years: list[str] | None = None
-) -> int:
-    """Union-concat every per-block ``fname`` (e.g. data_wide.csv) into one CSV.
-
-    The per-block files are the authoritative current state (one file per block,
-    overwritten on each scrape), so this de-duplicates by construction. Returns
-    the number of data rows written.
-
-    Reads through :class:`BlockStore`, so it works whether the tree is live on
-    disk or compacted into a zstd archive. Two passes: the header is the union of
-    every block's columns in first-seen order, which is not known until all are
-    read.
-    """
-    store = BlockStore(data_dir)
-    years = years if years is not None else store.years()
-
-    fields: list[str] = []
-    seen: set[str] = set()
-    for year in years:
-        for blk in store.iter_blocks(year, names={fname}):
-            for col in blk.header(fname):
-                if col not in seen:
-                    seen.add(col)
-                    fields.append(col)
-
-    if not fields:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_text("", encoding="utf-8")
-        return 0
-
-    n = 0
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    with dst.open("w", newline="", encoding="utf-8") as fo:
-        writer = csv.DictWriter(fo, fieldnames=fields, extrasaction="ignore", restval="")
-        writer.writeheader()
-        for year in years:
-            for blk in store.iter_blocks(year, names={fname}):
-                for row in blk.rows(fname):
-                    # Operational paths are stored relative to the collection
-                    # root so a resumable run can be moved without leaving
-                    # stale absolute/staging paths in the analysis release.
-                    block_rel = blk.rel.as_posix()
-                    if "block_dir" in row:
-                        row["block_dir"] = block_rel
-                    if "block_data_wide_csv" in row:
-                        row["block_data_wide_csv"] = f"{block_rel}/{DATA_WIDE_CSV}"
-                    if "block_html_file" in row and row.get("block_page"):
-                        page = int(row["block_page"])
-                        row["block_html_file"] = f"{block_rel}/html/page_{page:03d}.html"
-                    writer.writerow(row)
-                    n += 1
-    return n

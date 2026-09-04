@@ -124,7 +124,11 @@ class FakePortal:
         return universe.HttpResponse(status=200, body=body, url=url)
 
 
-def test_collect_universe_is_typed_resumable_and_conserves_rows(tmp_path: Path):
+def test_collect_universe_is_typed_resumable_and_conserves_rows(tmp_path: Path, monkeypatch):
+    # The fake portal serves one state; the real control table lists 29.
+    monkeypatch.setitem(
+        universe.OFFICIAL_FINAL_GP_COUNTS, "2022-2023", {"Uttar Pradesh": 1, "__india__": 1}
+    )
     portal = FakePortal()
     table, manifest = universe.collect_universe(
         tmp_path,
@@ -159,6 +163,8 @@ def test_collect_universe_is_typed_resumable_and_conserves_rows(tmp_path: Path):
         "blocks": 1,
         "gp_endpoint_rows": 1,
         "hierarchy_null_sentinels": 0,
+        "published_scored_gp_count": 1,
+        "hierarchy_minus_published": 0,
         "parquet_rows": 1,
     }
 
@@ -303,3 +309,10 @@ def test_parquet_schema_keeps_identifiers_as_strings():
     assert expected["block_value"] == pa.string()
     assert expected["gp_code"] == pa.string()
     assert all(not field.nullable for field in universe.UNIVERSE_SCHEMA)
+
+
+def test_exclusion_applies_only_to_the_reviewed_response():
+    exclusion = {"district_value": "340", "source_sha256": "a" * 64, "evidence": "reviewed"}
+    universe.check_exclusion_source(exclusion, {"sha256": "a" * 64})
+    with pytest.raises(ValueError, match="re-review before excluding"):
+        universe.check_exclusion_source(exclusion, {"sha256": "b" * 64})

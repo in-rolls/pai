@@ -78,7 +78,12 @@ def verify(data_dir: Path) -> dict[str, Any]:
             raise AssertionError("unscored hierarchy row contains score values")
 
     scores = table.filter(table.column("score_available"))
-    official_counts_checked = validate_release_coverage(scores)
+    state_names = dict(
+        zip(table.column("state_value").to_pylist(), table.column("state").to_pylist(), strict=True)
+    )
+    official_counts_checked = validate_release_coverage(
+        scores, manifest.get("score_hierarchy_corrections", []), state_names
+    )
     if manifest.get("official_counts_checked") != official_counts_checked:
         raise AssertionError("manifest official-count checks differ from packaged data")
     if manifest.get("score_quality") != validate_score_values(scores):
