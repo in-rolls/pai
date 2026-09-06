@@ -3,13 +3,13 @@
 Changes are organized by tagged data release. Corrections come first because they are the
 changes most likely to affect an analysis already in progress.
 
-## Unreleased
+## v0.2.1 — 2026-09-05
 
 - `docs/pai_indicators.csv`: the indicator framework behind each theme score, one row per
   version, theme and indicator (516 PAI 1.0 rows over 435 distinct ids; 150 PAI 2.0 rows over
   119), fetched from the portal's indicator browser by `scripts/pai_indicators.py` under a
-  typed contract with asserts; documented in README and DATA_DICTIONARY; included in the next
-  Hub publish.
+  typed contract with asserts; documented in README and DATA_DICTIONARY; published to the Hub
+  alongside the unchanged v0.2.0 data package (same `pai_gp.parquet` bytes).
 
 ## v0.2.0 — 2026-09-04
 

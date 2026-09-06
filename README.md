@@ -237,7 +237,7 @@ uv run scripts/data_summary.py                        # coverage tables -> docs/
 uv run scripts/scrape_progress.py --data-dir data --year 2023-2024
 uv run scripts/pai_inspect_output.py --out data       # quick counts
 make data-package DERIVED=data/derived                # -> data/release/pai_gp.parquet + MANIFEST.json
-uv run scripts/publish_hf.py --repo soodoku/pai --version 0.2.0 --card docs/hf_dataset_card.md
+uv run scripts/publish_hf.py --repo soodoku/pai --version 0.2.1 --card docs/hf_dataset_card.md
 ```
 
 Each `derived/` directory contains `gp_scores_wide.parquet` (canonical one row per GP),
@@ -297,7 +297,7 @@ make test     # pytest
 make check    # lint + test
 make data-package DERIVED=/path/to/validated/derived
 make verify-data
-make release-check VERSION=0.2.0
+make release-check VERSION=0.2.1
 ```
 
 `release-check` does not create a tag. It requires a clean `main` worktree, a dated changelog

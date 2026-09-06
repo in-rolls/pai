@@ -1,6 +1,6 @@
 [project]
 name = "pai-scraper"
-version = "0.2.0"
+version = "0.2.1"
 description = "Scraper and data tools for the Panchayat Advancement Index (PAI) Gram Panchayat scores"
 readme = "README.md"
 license = "MIT"
