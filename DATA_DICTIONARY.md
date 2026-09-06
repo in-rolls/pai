@@ -38,7 +38,7 @@ One row per (`pai_version`, `theme_number`, `indicator_id`), fetched from the po
 indicator browser by `scripts/pai_indicators.py`; `tests/test_indicators.py` re-checks the
 committed file. Contract: key unique; no missing values; 516 PAI 1.0 and 150 PAI 2.0 rows
 (435 and 119 distinct ids); every version covers all nine themes; a `ratio` row has a
-non-empty denominator.
+non-empty denominator; `kind` is one of `ratio`, `number`, `binary`.
 
 | column | type | meaning | provenance |
 |---|---|---|---|
@@ -48,7 +48,7 @@ non-empty denominator.
 | `theme_slug` | string | the release column stem for the theme, e.g. `t8_panchayat_with_good_governance` | `CANONICAL_THEME_SLUGS` |
 | `indicator_id` | int64 | the portal's indicator id, the bracketed suffix of its label. The portal repeats an id under alias wordings within a theme and only the first is kept; the same id can appear under several themes | portal |
 | `mandatory` | string | `Mandatory` or `Optional` | portal column |
-| `kind` | string | `ratio` (denominator distinct from numerator) or `binary` (yes/no check) | derived by `classify()` |
+| `kind` | string | `ratio` (denominator distinct from numerator), `number` (a single reported quantity, matched on the label: number of, total, percentage, share of, ratio of, rate of, drop-out rate, average) or `binary` (a yes/no check) | derived by `classify()` from the portal's columns, not from a Ministry label |
 | `indicator`, `numerator`, `denominator` | string | labels without their ids; `denominator` is empty for checks | portal columns |
 | `source_url` | string | page fetched | script |
 | `retrieved_utc` | string | ISO 8601 UTC timestamp of the fetch | script |

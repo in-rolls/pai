@@ -52,24 +52,26 @@ lists every indicator per theme and version with its numerator and denominator, 
 from the portal's [indicator browser](https://pai.gov.in/MMS/Indicator/Theme-Indicators.aspx?t=8&s=2)
 by `uv run scripts/pai_indicators.py`, which asserts the column contract, key uniqueness
 and the counts below. An indicator used in several themes is listed once per theme, which
-is how the Ministry arrives at 516 and 150. "Rates" have a denominator distinct from the
-numerator; "checks" are yes/no questions; the split is derived from the portal's columns,
-not from a Ministry label. PAI 2.0 cut the framework from 516 rows to 150, and in Good
-Governance replaced most rates with checks; few indicator ids carry over, so the two
+is how the Ministry arrives at 516 and 150. A "ratio" has a denominator distinct from its
+numerator; a "number" is a single reported quantity (drop-out rates, female-to-male
+enrollment ratios); a "check" is a yes/no question. The kind follows the portal's data
+columns, not the label wording, so a "Whether ward sabhas were conducted" scored as ward
+sabhas over wards counts as a ratio. PAI 2.0 cut the framework from 516 rows to 150, and in
+Good Governance replaced most ratios with checks; few indicator ids carry over, so the two
 vintages are separate measures, not a panel.
 
-| Theme | PAI 1.0 indicators (rates / checks) | PAI 2.0 indicators (rates / checks) |
+| Theme | PAI 1.0 indicators (ratios / numbers / checks) | PAI 2.0 indicators (ratios / numbers / checks) |
 |---|---:|---:|
-| T1 Poverty-free and enhanced livelihoods | 32 (28 / 4) | 14 (12 / 2) |
-| T2 Healthy | 21 (21 / 0) | 15 (10 / 5) |
-| T3 Child-friendly | 82 (61 / 21) | 15 (13 / 2) |
-| T4 Water-sufficient | 21 (14 / 7) | 10 (4 / 6) |
-| T5 Clean and green | 33 (25 / 8) | 11 (6 / 5) |
-| T6 Self-sufficient infrastructure | 159 (30 / 129) | 18 (4 / 14) |
-| T7 Socially just and secured | 62 (38 / 24) | 20 (13 / 7) |
-| T8 Good governance | 62 (25 / 37) | 26 (3 / 23) |
-| T9 Women-friendly | 44 (37 / 7) | 21 (14 / 7) |
-| Total theme-indicator rows (distinct ids) | 516 (435) | 150 (119) |
+| T1 Poverty-free and enhanced livelihoods | 32 (29 / 0 / 3) | 14 (12 / 0 / 2) |
+| T2 Healthy | 21 (21 / 0 / 0) | 15 (10 / 0 / 5) |
+| T3 Child-friendly | 82 (64 / 3 / 15) | 15 (13 / 0 / 2) |
+| T4 Water-sufficient | 21 (14 / 0 / 7) | 10 (4 / 0 / 6) |
+| T5 Clean and green | 33 (25 / 0 / 8) | 11 (6 / 0 / 5) |
+| T6 Self-sufficient infrastructure | 159 (30 / 0 / 129) | 18 (4 / 0 / 14) |
+| T7 Socially just and secured | 62 (41 / 0 / 21) | 20 (13 / 0 / 7) |
+| T8 Good governance | 62 (27 / 0 / 35) | 26 (3 / 0 / 23) |
+| T9 Women-friendly | 44 (39 / 0 / 5) | 21 (14 / 3 / 4) |
+| Total theme-indicator rows (distinct ids) | 516 (290 / 3 / 223) (435) | 150 (79 / 3 / 68) (119) |
 
 Full per-state breakdown: [`docs/pai_summary_by_state.csv`](docs/pai_summary_by_state.csv)
 (year totals: [`docs/pai_summary.csv`](docs/pai_summary.csv)). Regenerate with
