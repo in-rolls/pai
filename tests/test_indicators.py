@@ -15,8 +15,8 @@ def test_committed_indicator_table_meets_its_contract():
     for r in theme8:
         kinds[(r["pai_version"], r["kind"])] = kinds.get((r["pai_version"], r["kind"]), 0) + 1
     assert kinds == {
-        ("PAI 1.0", "binary"): 37,
-        ("PAI 1.0", "ratio"): 25,
+        ("PAI 1.0", "binary"): 35,
+        ("PAI 1.0", "ratio"): 27,
         ("PAI 2.0", "binary"): 23,
         ("PAI 2.0", "ratio"): 3,
     }
@@ -70,4 +70,8 @@ def test_parse_dedupes_aliases_and_classify_uses_the_denominator():
         (717, "binary", "Optional"),
     ]
     assert records[0]["theme_slug"] == "t8_panchayat_with_good_governance"
-    assert ind.classify("Number of works monitored", "works", "") == "binary"
+    assert ind.classify("Number of works monitored", "works", "") == "number"
+    assert ind.classify("Drop-out Rate (Primary)", "Drop-out rate (Primary)", "") == "number"
+    assert ind.classify("Ratio of female-male enrolled", "Ratio of female-male", "") == "number"
+    assert ind.classify("Did GP ensure participation of SC/STs?", "Did GP ensure", "") == "binary"
+    assert ind.classify("Whether Gram Sabha conducted", "Whether Gram Sabha", "") == "binary"

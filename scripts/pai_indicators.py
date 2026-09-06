@@ -56,7 +56,11 @@ INDICATOR_SCHEMA = pa.schema(
     ]
 )
 KEY = ("pai_version", "theme_number", "indicator_id")
-KINDS = {"ratio", "binary"}
+KINDS = {"ratio", "number", "binary"}
+NUMERIC_LABEL = re.compile(
+    r"^(number of|no\. of|total |percentage|share of|ratio of|rate of|drop-?out rate|average)",
+    re.I,
+)
 MANDATORY = {"Mandatory", "Optional"}
 REQUIRED_TEXT = ("indicator", "numerator", "source_url", "retrieved_utc")
 
@@ -100,11 +104,13 @@ def parse(page: str) -> list[tuple[str, str, str, str]]:
 
 
 def classify(indicator: str, numerator: str, denominator: str) -> str:
-    """A ratio has a denominator distinct from its numerator; the rest are yes/no checks."""
-    if indicator.lower().startswith("whether"):
-        return "binary"
+    """Ratio: a denominator distinct from the numerator. Number: a single reported
+    quantity (a rate, ratio or count entered directly). Binary: everything else,
+    which on the portal is a yes/no wording ("Whether", "If ..., whether", "Did")."""
     if denominator and denominator.lower() != numerator.lower():
         return "ratio"
+    if NUMERIC_LABEL.match(indicator):
+        return "number"
     return "binary"
 
 
