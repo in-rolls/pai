@@ -31,3 +31,24 @@ Score absence is structural portal nonpublication, not a zero score. The release
 why a hierarchy GP lacks a score. PAI 1.0 and PAI 2.0 also use different indicator systems: the
 two vintages are separate cross-sectional measures, not repeated observations of an invariant
 scale.
+
+## Indicator framework: `docs/pai_indicators.csv`
+
+One row per (`pai_version`, `theme_number`, `indicator_id`), fetched from the portal's
+indicator browser by `scripts/pai_indicators.py`; `tests/test_indicators.py` re-checks the
+committed file. Contract: key unique; no missing values; 516 PAI 1.0 and 150 PAI 2.0 rows
+(435 and 119 distinct ids); every version covers all nine themes; a `ratio` row has a
+non-empty denominator.
+
+| column | type | meaning | provenance |
+|---|---|---|---|
+| `pai_version` | string | `PAI 1.0` or `PAI 2.0` | portal query `s=1` / `s=2` |
+| `fiscal_year` | string | `2022-2023` or `2023-2024`; fixed by `pai_version` | PAI release year |
+| `theme_number` | int8 | 1 to 9 | portal query `t` |
+| `theme_slug` | string | the release column stem for the theme, e.g. `t8_panchayat_with_good_governance` | `CANONICAL_THEME_SLUGS` |
+| `indicator_id` | int64 | the portal's indicator id, the bracketed suffix of its label. The portal repeats an id under alias wordings within a theme and only the first is kept; the same id can appear under several themes | portal |
+| `mandatory` | string | `Mandatory` or `Optional` | portal column |
+| `kind` | string | `ratio` (denominator distinct from numerator) or `binary` (yes/no check) | derived by `classify()` |
+| `indicator`, `numerator`, `denominator` | string | labels without their ids; `denominator` is empty for checks | portal columns |
+| `source_url` | string | page fetched | script |
+| `retrieved_utc` | string | ISO 8601 UTC timestamp of the fetch | script |

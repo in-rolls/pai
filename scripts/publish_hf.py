@@ -117,6 +117,9 @@ def universe_source_archive(universe_dir: Path) -> Path:
     return dst
 
 
+INDICATORS_CSV = Path(__file__).resolve().parents[1] / "docs" / "pai_indicators.csv"
+
+
 def collect_files(
     data_dir: Path, release_dir: Path, card: Path | None, universe_dir: Path | None = None
 ) -> dict[str, Path]:
@@ -138,6 +141,7 @@ def collect_files(
     for stem in ("block_manifest", "dropdown_inventory"):
         files[f"logs/{stem}.parquet"] = data_dir / f"{stem}.parquet"
     files["logs/block_count_audit.csv"] = data_dir / "block_count_audit.csv"
+    files["docs/pai_indicators.csv"] = INDICATORS_CSV
     if card is not None:
         files["README.md"] = card
     missing = [remote for remote, local in files.items() if not local.exists()]

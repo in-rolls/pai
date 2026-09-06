@@ -54,6 +54,7 @@ def test_published_bundle_includes_what_expand_and_rebuild_need(tmp_path):
     assert "archives/compact_2023-2024.json" in files
     assert "logs/block_manifest.parquet" in files
     assert "logs/block_count_audit.csv" in files
+    assert files["docs/pai_indicators.csv"].exists()
     (data / "compact_2023-2024.json").unlink()
     with pytest.raises(SystemExit, match="compact_2023-2024.json"):
         publish_hf.collect_files(data, release, None)

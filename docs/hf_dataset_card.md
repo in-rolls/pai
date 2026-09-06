@@ -32,6 +32,7 @@ Code, contracts, and the scraper that rebuilds everything:
 | --- | --- |
 | `release/pai_gp.parquet` | one row per hierarchy GP × vintage, key `(year, gp_code)`; `score_available` marks GPs the portal never scored (scores null, never zero) |
 | `release/MANIFEST.json` | version, schema, row counts, byte sizes, SHA-256 checksums |
+| `docs/pai_indicators.csv` | the indicator framework behind each theme score: one row per version, theme and indicator (516 PAI 1.0 rows, 150 PAI 2.0), with numerator, denominator and rate-or-check kind, fetched from the portal's indicator browser |
 | `archives/blocks_<year>.tar.zst` | per-block typed Parquet cache — rebuilds the release table without a browser |
 | `archives/html_<year>.tar.zst` | rendered page captures — the raw source evidence |
 

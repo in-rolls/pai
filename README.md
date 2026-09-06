@@ -44,6 +44,33 @@ codes; the retired flat `TW-GP-New.aspx` route is incomplete and is not used.
 | 2022-2023 | 29 / 34 | 753 | 216,256 | 2,162,560 | 6,318 / 872 |
 | 2023-2024 | 33 / 34 | 741 | 259,867 | 2,598,670 | 6,766 / 369 |
 
+### Indicator framework
+
+Each theme score aggregates equally weighted indicators that the Gram Panchayat reports on
+the portal and the Gram Sabha and district validate. [`docs/pai_indicators.csv`](docs/pai_indicators.csv)
+lists every indicator per theme and version with its numerator and denominator, as fetched
+from the portal's [indicator browser](https://pai.gov.in/MMS/Indicator/Theme-Indicators.aspx?t=8&s=2)
+by `uv run scripts/pai_indicators.py`, which asserts the column contract, key uniqueness
+and the counts below. An indicator used in several themes is listed once per theme, which
+is how the Ministry arrives at 516 and 150. "Rates" have a denominator distinct from the
+numerator; "checks" are yes/no questions; the split is derived from the portal's columns,
+not from a Ministry label. PAI 2.0 cut the framework from 516 rows to 150, and in Good
+Governance replaced most rates with checks; few indicator ids carry over, so the two
+vintages are separate measures, not a panel.
+
+| Theme | PAI 1.0 indicators (rates / checks) | PAI 2.0 indicators (rates / checks) |
+|---|---:|---:|
+| T1 Poverty-free and enhanced livelihoods | 32 (28 / 4) | 14 (12 / 2) |
+| T2 Healthy | 21 (21 / 0) | 15 (10 / 5) |
+| T3 Child-friendly | 82 (61 / 21) | 15 (13 / 2) |
+| T4 Water-sufficient | 21 (14 / 7) | 10 (4 / 6) |
+| T5 Clean and green | 33 (25 / 8) | 11 (6 / 5) |
+| T6 Self-sufficient infrastructure | 159 (30 / 129) | 18 (4 / 14) |
+| T7 Socially just and secured | 62 (38 / 24) | 20 (13 / 7) |
+| T8 Good governance | 62 (25 / 37) | 26 (3 / 23) |
+| T9 Women-friendly | 44 (37 / 7) | 21 (14 / 7) |
+| Total theme-indicator rows (distinct ids) | 516 (435) | 150 (119) |
+
 Full per-state breakdown: [`docs/pai_summary_by_state.csv`](docs/pai_summary_by_state.csv)
 (year totals: [`docs/pai_summary.csv`](docs/pai_summary.csv)). Regenerate with
 `uv run scripts/data_summary.py`.
