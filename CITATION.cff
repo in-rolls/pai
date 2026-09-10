@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "Cite the release tag or commit used. The Dataverse reference identifies the historical deposit only."
+type: dataset
+title: "Panchayat Advancement Index data"
+authors:
+  - family-names: Sood
+    given-names: Gaurav
+    email: contact@gsood.com
+repository-code: "https://github.com/in-rolls/pai"
+url: "https://huggingface.co/datasets/soodoku/pai"
+license: MIT
+keywords:
+  - India
+  - Gram Panchayat
+  - governance
+  - Panchayat Advancement Index
+references:
+  - type: data
+    title: "Panchayat Advancement Index (2022--2024)"
+    authors:
+      - family-names: Sood
+        given-names: Gaurav
+    doi: 10.7910/DVN/FRUKWS
+    version: "2.0"
+    license: CC0-1.0
