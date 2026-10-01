@@ -1,6 +1,5 @@
 # Panchayat Advancement Index data
 
-[![CI](https://github.com/in-rolls/pai/actions/workflows/ci.yml/badge.svg)](https://github.com/in-rolls/pai/actions/workflows/ci.yml)
 [![Dataset](https://img.shields.io/badge/Hugging%20Face-soodoku%2Fpai-blue)](https://huggingface.co/datasets/soodoku/pai)
 
 Gram Panchayat scores from the Government of India's [Panchayat Advancement Index](https://pai.gov.in), covering PAI 1.0 (2022–2023) and PAI 2.0 (2023–2024). The published table retains every Gram Panchayat in the collected official hierarchy, including those without scores. This repository provides the versioned data, its validation rules, and the tools that reproduce it.
@@ -82,7 +81,7 @@ Python 3.14 or newer is required for the standard-library Zstandard archive supp
 
 ## Development
 
-`make check` runs lint, formatting, tests, and pre-commit hooks. `make verify-data` checks the committed release's schema, keys, counts, and hashes. `make ci-docker` runs the checks in a standard Python 3.14 container with Chromium. GitHub CI also verifies the committed data package.
+`make check` runs lint, formatting, tests. `make verify-data` checks the committed release's schema, keys, counts, and hashes. Run `make verify-data` explicitly when the data change.
 
 Release changes are documented in [CHANGELOG.md](CHANGELOG.md). `make release-check VERSION=<version>` performs the existing release preflight; it does not create a tag. Collection and publishing commands are in the [guide](docs/collection.md).
 
@@ -93,3 +92,7 @@ Cite Gaurav Sood, *Panchayat Advancement Index data*, and identify the release t
 ## License
 
 The code and current Hugging Face data release use the [MIT License](LICENSE), as recorded in the [dataset card](docs/hf_dataset_card.md). The historical Dataverse deposit is released under CC0 1.0.
+
+## Maintenance
+
+This is a point-in-time data collection; see the [shared maintenance policy](https://github.com/soodoku/data-repos#maintenance-policy). Run the affected parser tests when code changes and the relevant data validators when inputs or outputs change. Full-data checks and publication are explicit operations. Routine edits do not require hosted CI, Docker, a Python-version matrix, Preen or pre-commit.

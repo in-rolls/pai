@@ -31,7 +31,6 @@ Changelog = "https://github.com/in-rolls/pai/blob/main/CHANGELOG.md"
 
 [dependency-groups]
 dev = [
-    "pre-commit>=4",
     "ruff>=0.14",
     "pytest>=8",
     "pytest-asyncio>=0.24",
