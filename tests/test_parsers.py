@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pai_scraper_resumable as scraper
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -15,7 +16,7 @@ async def _parse(fixture: str, selector: str, layout: str) -> dict:
     async with async_playwright() as p:
         try:
             browser = await p.chromium.launch(headless=True)
-        except Exception as e:  # chromium not installed in this env
+        except PlaywrightError as e:  # chromium not installed in this env
             pytest.skip(f"chromium unavailable: {e}")
         page = await (await browser.new_context()).new_page()
         await page.set_content((FIXTURES / fixture).read_text(encoding="utf-8"))
